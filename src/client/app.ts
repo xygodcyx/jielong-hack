@@ -1,4 +1,6 @@
+import type { DailyCheckin } from '../automation-shared.ts'
 import type { Draft, Field, FormSchema, JsonObject, RecordValue, Thread } from '../shared.ts'
+import { runLabels } from '../automation-shared.ts'
 import { blankValue, fieldLabels } from '../shared.ts'
 import { $, bytes, esc, icon, readDraft, removeDraft, request, safeUrl, writeDraft } from './helpers.ts'
 import { composeImage, WATERMARK_RENDER_VERSION, watermarkDefaults } from './watermark.ts'
@@ -33,6 +35,9 @@ let search = ''
 let savedAt = ''
 let lastPreviewUrl = ''
 let taskLoadEpoch = 0
+let scheduled: { plan: JsonObject, run: DailyCheckin, editable: boolean, mailConfigured: boolean } | null = null
+let pendingAutomatic: JsonObject | null = null
+let automationReturn = new URLSearchParams(location.search).has('automation')
 const app = $('#app')
 const modalRoot = $('#modal-root')
 function typeLabel(n: number) {
@@ -51,7 +56,11 @@ function toast(message: string, error = false) {
   $('#toasts').append(node)
   setTimeout(() => node.remove(), 5000)
 }
-const draftKey = () => `${me.scope || 'guest'}:${schema?.thread.id}:${schema?.recordId || 0}`
+function draftKey() {
+  return `${me.scope || 'guest'}:${scheduled
+    ? `automatic:${scheduled.plan.id}:${scheduled.run.date}`
+    : `${schema?.thread.id}:${schema?.recordId || 0}`}`
+}
 function changed() {
   submitted = false
   prepared = null
@@ -69,6 +78,10 @@ async function saveCurrent() {
     locals: locals.map(({ url: _, ...f }) => f),
     watermark,
     schemaHash: JSON.stringify(schema.fields),
+    scheduleRevision: scheduled?.run.revision,
+    scheduleTime: scheduled?.plan.time,
+    scheduleRecipient: scheduled?.plan.recipient,
+    schedulePrivacy: scheduled?.run.privacyAgreed,
     at: Date.now(),
   })
   savedAt = new Intl.DateTimeFormat('zh-CN', {
@@ -78,8 +91,11 @@ async function saveCurrent() {
     hour12: false,
   }).format(new Date())
   const label = $('#save-state')
-  if (label)
-    label.textContent = `草稿已保存 ${savedAt}`
+  if (label) {
+    label.textContent = scheduled
+      ? `本机已暂存 ${savedAt} · 请保存待办`
+      : `草稿已保存 ${savedAt}`
+  }
 }
 function releaseUrls() {
   for (const f of locals) {
@@ -96,6 +112,7 @@ function shell(content: string) {
     ${[
       ['tasks', 'grid', '我的任务'],
       ['manual', 'edit', '手动添加'],
+      ['automation', 'clock', '自动签到'],
       ['studio', 'layers', '水印工作室'],
       ['history', 'file', '提交记录'],
     ].map(([id, i, label]) => button(`${icon(i)}<span>${label}</span>${id === 'studio'
@@ -103,7 +120,7 @@ function shell(content: string) {
       : ''}`, `nav-${id}`, `nav-item ${view === id
       ? 'active'
       : ''}`)).join('')}</nav>
-    <div class="sidebar-bottom"><div class="local-note">${icon('shield')}<span>本机保存登录状态<small>你来决定每一次提交</small></span></div>${button(`${icon('help')} 使用说明`, 'help', 'nav-item')}
+    <div class="sidebar-bottom"><div class="local-note">${icon('shield')}<span>本机保存登录状态<small>手动确认或按计划执行</small></span></div>${button(`${icon('help')} 使用说明`, 'help', 'nav-item')}
     <div class="profile"><span class="avatar">${esc(me.user?.name?.slice(0, 1) || '未')}</span><div><strong>${esc(me.user?.name || '尚未登录')}</strong><small>${me.demo
       ? '演示空间'
       : me.authenticated ? '微信已连接' : '连接你的微信账号'}</small></div>${me.authenticated
@@ -113,9 +130,11 @@ function shell(content: string) {
       ? '水印工作室'
       : view === 'manual'
         ? schema ? '手动添加 / 编辑任务' : '手动添加'
-        : view === 'history'
-          ? '提交记录'
-          : schema ? '编辑任务' : '我的任务'}</div><div class="topbar-end">${me.demo
+        : view === 'automation'
+          ? scheduled ? '自动签到 / 编辑待办' : '自动签到'
+          : view === 'history'
+            ? '提交记录'
+            : schema ? '编辑任务' : '我的任务'}</div><div class="topbar-end">${me.demo
       ? '<span class="badge demo-badge">演示模式</span>'
       : me.authenticated ? '<span class="connected"><i></i> 微信已连接</span>' : '<span class="muted">本地工作台</span>'}<span class="top-date">${new Intl.DateTimeFormat('zh-CN', {
       timeZone: 'Asia/Shanghai',
@@ -123,7 +142,9 @@ function shell(content: string) {
       day: 'numeric',
       weekday: 'short',
     }).format(new Date())}</span></div></header>
-    <main id="main" tabindex="-1">${content}</main><footer class="app-footer"><span>接龙工作台 · 让每一份记录井井有条</span><span>LOCAL WORKSPACE</span></footer></div>`
+    ${me.expired
+      ? `<div id="auth-banner" class="notice auth-banner">登录已失效，循环签到等待重新登录。${button('微信扫码恢复', 'login', 'button')}</div>`
+      : ''}<main id="main" tabindex="-1">${content}</main><footer class="app-footer"><span>接龙工作台 · 让每一份记录井井有条</span><span>LOCAL WORKSPACE</span></footer></div>`
 }
 function welcome() {
   shell(`<section class="page-heading"><div><div class="eyebrow">YOUR DAILY WORKSPACE</div><h1>把每一次签到，<br class="mobile-break">都安排妥当。</h1><p>连接微信，集中查看接龙与打卡。照片、视频、位置，在一处编辑。</p></div><span class="heading-mark">${icon('grid')}</span></section>
@@ -133,6 +154,7 @@ function welcome() {
 }
 function tasksPage() {
   schema = null
+  scheduled = null
   const manual = view === 'manual'
   shell(`<section class="page-heading compact"><div><div class="eyebrow">${manual ? 'SAVED TASKS' : 'MY WORKSPACE'}</div><h1>${manual ? '手动添加' : '我的任务'}<span class="title-dot">.</span></h1><p>${manual ? '通过链接或 ID 添加的任务，已保存在当前账号下。' : '接龙、签到与打卡，在这里统一处理。'}</p></div><div class="heading-actions">${button(`${icon('plus')} 添加任务`, 'import', 'button')}${button(`${icon('refresh')} 刷新`, 'refresh', 'button primary')}</div></section>
     ${me.demo ? '<div class="notice demo-notice">演示空间使用虚拟任务。你可以编辑、上传、生成水印并体验提交，不会影响真实记录。</div>' : ''}
@@ -373,37 +395,61 @@ function editorPage() {
   const studio = view === 'studio'
   const hasWatermark = schema.fields.some(f => f.FieldType === 25)
   shell(`<section class="editor-heading"><div><div class="editor-breadcrumb">${!studio
-    ? button(`${icon('back')} ${view === 'manual'
-        ? '手动添加'
-        : '我的任务'}`, view === 'manual'
-        ? 'nav-manual'
-        : 'nav-tasks', 'text-button')
+    ? button(`${icon('back')} ${scheduled
+        ? '自动签到'
+        : view === 'manual'
+          ? '手动添加'
+          : '我的任务'}`, scheduled
+        ? 'nav-automation'
+        : view === 'manual'
+          ? 'nav-manual'
+          : 'nav-tasks', 'text-button')
     : '<span class="eyebrow">PHOTO STUDIO</span>'}</div><h1>${esc(schema.thread.title)}</h1><p>${studio
     ? '一张照片，一份清晰的时间与地点记录。'
-    : `${typeLabel(schema.thread.type)} · ${esc(schema.thread.author || '接龙管家')} · ${schema.recordId ? '编辑已有记录' : '新建记录'}`}</p>${!studio
+    : scheduled
+      ? `循环打卡 · ${esc(scheduled.run.date)} · ${esc(runLabels[scheduled.run.status])}`
+      : `${typeLabel(schema.thread.type)} · ${esc(schema.thread.author || '接龙管家')} · ${schema.recordId ? '编辑已有记录' : '新建记录'}`}</p>${!studio
     ? `<div class="thread-identifier"><span>ThreadId</span><code>${esc(schema.thread.id)}</code></div>`
     : ''}</div><div class="heading-actions">${!studio
-    ? button(`${icon('file')} 我的已有记录`, 'records', 'button')
+    ? scheduled
+      ? button(`${icon('refresh')} 更新原表单`, 'auto-refresh-form', 'button', scheduled.editable ? '' : 'disabled') + button(scheduled.run.date === beijingDay()
+        ? '编辑明日待办'
+        : '查看今日待办', 'auto-other-day', 'button')
+      : button(`${icon('file')} 我的已有记录`, 'records', 'button') + (schema.thread.type === 5
+        ? button(`${icon('clock')} 启动循环签到`, 'auto-start', 'button primary')
+        : '')
     : ''}<span id="save-state" class="draft-state">${savedAt
-    ? `草稿已保存 ${savedAt}`
-    : '自动保存本地草稿'}</span></div></section>
-    ${!schema.canSubmit
+    ? scheduled
+      ? `本机已暂存 ${savedAt} · 请保存待办`
+      : `草稿已保存 ${savedAt}`
+    : scheduled ? '待办保存在本机服务端' : '自动保存本地草稿'}</span></div></section>
+    ${!schema.canSubmit && !scheduled
       ? `<div class="notice error-notice">${esc(schema.unavailableReason)}</div>`
       : ''}${!studio && me.demo
       ? '<div class="notice demo-notice">当前为演示任务，所有提交仅记录在本机。</div>'
       : ''}
-    <div class="editor-grid"><form id="editor-form" class="editor-form"><section class="form-card"><div class="card-heading"><span class="feature-icon">${icon(studio ? 'layers' : 'edit')}</span><div><h2>${studio ? '上传照片' : '填写表单'}</h2><p>${studio ? '支持 JPEG、PNG、WebP，可批量生成水印。' : '根据任务要求，准备好这次的记录。'}</p></div></div>
+    <div class="editor-grid"><form id="editor-form" class="editor-form">${scheduled
+      ? automaticSettings()
+      : ''}<fieldset class="editor-fields" ${scheduled && !scheduled.editable
+      ? 'disabled'
+      : ''}><section class="form-card"><div class="card-heading"><span class="feature-icon">${icon(studio ? 'layers' : 'edit')}</span><div><h2>${studio ? '上传照片' : '填写表单'}</h2><p>${studio ? '支持 JPEG、PNG、WebP，可批量生成水印。' : '根据任务要求，准备好这次的记录。'}</p></div></div>
     ${!studio
       ? `<div class="identity-fields">${input(`署名${schema.requireSignature ? '<span class="required">*</span>' : ''}`, draft.signature, `id="signature-input" maxlength="200" placeholder="请输入署名" ${schema.requireSignature ? 'required' : ''}`)}${schema.requireNumber
         ? input(`${esc(schema.numberLabel)}<span class="required">*</span>`, draft.number, 'id="number-input" maxlength="200" required')
         : ''}</div>`
       : ''}${schema.fields.map(f => fieldHtml(f, draft.values.find(v => v.FieldId === f.Id) || blankValue(f))).join('')}
-    ${schema.needPrivacy ? '<label class="privacy-consent"><input id="privacy-consent" type="checkbox" required>我已阅读原任务的个人信息使用说明，同意将所填内容提交至该任务。</label>' : ''}</section>
-    <div class="editor-submit"><span>${icon('shield')} ${studio ? '图片在本地生成' : '核对预览后，再确认提交'}</span>${button(studio
-      ? `${icon('download')} 导出水印照片`
-      : `${icon('eye')} 预览并准备提交`, studio ? 'export' : 'prepare', 'button primary large', !schema.canSubmit && !studio
-      ? 'disabled'
-      : '')}</div></form>
+    ${schema.needPrivacy
+      ? `<label class="privacy-consent"><input id="privacy-consent" type="checkbox" required ${scheduled?.run.privacyAgreed ? 'checked' : ''}>我已阅读原任务的个人信息使用说明，同意将所填内容提交至该任务。</label>`
+      : ''}</section></fieldset>
+    <div class="editor-submit"><span>${icon('shield')} ${studio
+      ? '图片在本地生成'
+      : scheduled ? '保存后按北京时间自动执行' : '核对预览后，再确认提交'}</span>${scheduled
+      ? `<div class="automatic-save-actions">${button(scheduled.plan.enabled ? '保存并暂停' : '仅保存待办', 'auto-save-paused', 'button', scheduled.editable ? '' : 'disabled')}${button(scheduled.plan.enabled ? '保存本次待办' : '保存并启动循环签到', 'auto-save', 'button primary large', scheduled.editable ? '' : 'disabled')}</div>`
+      : button(studio
+          ? `${icon('download')} 导出水印照片`
+          : `${icon('eye')} 预览并准备提交`, studio ? 'export' : 'prepare', 'button primary large', !schema.canSubmit && !studio
+          ? 'disabled'
+          : '')}</div></form>
     <aside class="preview-sidebar"><section class="preview-card"><div class="preview-card-title"><h2>${hasWatermark ? '照片预览' : '表单概览'}</h2><span class="badge subtle">实时预览</span></div><div id="photo-preview" class="photo-preview"><div class="preview-placeholder">${icon('layers')}<strong>让照片带上你的记录</strong><span>选择照片后，在这里预览效果</span></div></div><div id="preview-caption" class="preview-caption">${hasWatermark ? '水印将直接合成到图片中' : '所有内容均可在提交前核对'}</div>${hasWatermark
       ? watermarkControls()
       : ''}</section>${!studio
@@ -465,6 +511,7 @@ async function openTask(id: string, recordId: string | number = 0, providedSchem
   await saveCurrent()
   const data = providedSchema || await request(`/api/threads/${encodeURIComponent(id)}/form?recordId=${encodeURIComponent(recordId)}`)
   releaseUrls()
+  scheduled = null
   schema = data
   submitted = false
   draft = {
@@ -504,6 +551,7 @@ async function openStudio() {
   taskLoadEpoch++
   await saveCurrent()
   releaseUrls()
+  scheduled = null
   view = 'studio'
   submitted = false
   schema = {
@@ -605,6 +653,7 @@ function modal(title: string, content: string, footer = '') {
 }
 function closeModal() {
   loginEpoch++
+  pendingAutomatic = null
   modalRoot.innerHTML = ''
 }
 async function login() {
@@ -622,7 +671,10 @@ async function login() {
       closeModal()
       me = await request('/api/auth/me')
       toast('微信连接成功')
-      await loadTasks()
+      if (automationReturn || view === 'automation')
+        await automationPage()
+      else
+        await loadTasks()
       return
     }
     if (result.status === 'expired') {
@@ -635,12 +687,7 @@ async function login() {
     await new Promise(r => setTimeout(r, 1500))
   }
 }
-async function prepare() {
-  const form = $<HTMLFormElement>('#editor-form')
-  if (!form.reportValidity())
-    return
-  await saveCurrent()
-  modal('正在准备预览', '<div class="prepare-progress"><span class="spinner"></span><h3 id="prepare-progress">正在验证表单…</h3><p>完成后请核对内容，再确认提交。</p></div>')
+async function stageOutgoing() {
   const outgoing = structuredClone(draft)
   for (const value of outgoing.values) {
     for (const [index, f] of value.Files.entries()) {
@@ -652,7 +699,8 @@ async function prepare() {
         ? { watermark, renderer: WATERMARK_RENDER_VERSION }
         : null)
       if (!local.stagedId || local.stagedFingerprint !== fingerprint) {
-        $('#prepare-progress').textContent = `正在处理 ${local.file.name}…`
+        if ($('#prepare-progress'))
+          $('#prepare-progress').textContent = `正在处理 ${local.file.name}…`
         const data = new FormData()
         let file = local.file
         if (field.FieldType === 25 && watermark.enabled) {
@@ -667,6 +715,17 @@ async function prepare() {
       value.Files[index] = { LocalId: local.stagedId }
     }
   }
+  return outgoing
+}
+async function prepare() {
+  if (scheduled)
+    throw new Error('请使用保存待办按钮。')
+  const form = $<HTMLFormElement>('#editor-form')
+  if (!form.reportValidity())
+    return
+  await saveCurrent()
+  modal('正在准备预览', '<div class="prepare-progress"><span class="spinner"></span><h3 id="prepare-progress">正在验证表单…</h3><p>完成后请核对内容，再确认提交。</p></div>')
+  const outgoing = await stageOutgoing()
   $('#prepare-progress').textContent = '正在上传附件并生成最终预览…'
   prepared = await request(`/api/threads/${encodeURIComponent(schema!.thread.id)}/prepare?recordId=${encodeURIComponent(schema!.recordId)}`, { ...outgoing, privacyAgreed: !schema!.needPrivacy || $<HTMLInputElement>('#privacy-consent')?.checked })
   const rows = prepared.payload.RecordValues.filter((v: RecordValue) => v.HasValue).map((v: RecordValue) => `<div class="review-row"><strong>${esc(v.FieldName)}</strong><div>${v.Texts.map((x: any) => `<span>${esc(x)}</span>`).join('')}${v.FieldType === 16 && v.Values[0]
@@ -713,6 +772,7 @@ async function exportImages() {
 async function historyPage() {
   await saveCurrent()
   schema = null
+  scheduled = null
   view = 'history'
   shell('<div class="empty-state">正在加载提交记录…</div>')
   if (!me.authenticated) {
@@ -742,7 +802,230 @@ async function showRecords() {
     ? `<div class="record-list">${data.records.map((r: any) => `<button class="record-item" data-action="edit-record" data-id="${esc(r.id)}" ${r.editable ? '' : 'disabled'}><span><strong>${esc(r.signature || '我的记录')}</strong><small>${esc(r.date)}</small></span><span>${r.editable ? '编辑' : '当前不可编辑'}</span></button>`).join('')}</div>`
     : '<div class="empty-state"><h3>当前列表没有可编辑的本人记录</h3><p>可新建记录，或在官网确认当前账号与权限。</p></div>')
 }
+function beijingDay(offset = 0) {
+  return new Date(Date.now() + 8 * 3600000 + offset * 86400000).toISOString().slice(0, 10)
+}
+function automaticSettings() {
+  const { plan, run, editable, mailConfigured } = scheduled!
+  return `<section class="form-card automatic-settings"><div class="card-heading"><span class="feature-icon">${icon('clock')}</span><div><h2>${esc(run.date)} · ${editable
+    ? '待签到内容'
+    : esc(runLabels[run.status])}</h2><p>${run.sourceDate
+    ? `初始内容来自 ${esc(run.sourceDate)} 的本人签到。`
+    : run.source === 'edited'
+      ? '这份内容已手动填写并保存。'
+      : '昨天没有本人签到记录，请填写这次的内容。'}</p></div><span class="badge ${plan.enabled ? '' : 'closed'}">${plan.enabled ? '循环已启动' : '已暂停'}</span></div>
+    <div class="notice ${editable ? '' : 'demo-notice'}">${esc(run.message)}${!editable
+      ? ' 可切换到下一次待办继续编辑。'
+      : ''}</div>
+    <div class="two-columns">${input('自动签到时间（北京时间）', plan.time, `id="auto-time" type="time" min="00:00" max="22:59" required ${editable ? '' : 'disabled'}`)}${input('通知邮箱（可留空）', plan.recipient, `id="auto-recipient" type="text" inputmode="email" placeholder="留空则仅在站内查看" maxlength="254" ${editable ? '' : 'disabled'}`)}</div>
+    <p class="field-tip">${mailConfigured ? '邮件服务可用；邮箱留空或填写不完整时使用站内模式。' : '邮件服务未配置完整，当前使用站内模式，不影响自动签到。'} 登录过期后，在网站重新扫码即可恢复。</p>
+    <p class="field-tip">到点后自动提交；若已过设定时间，会在当天 23:00 前核对并补交。复用的照片保留原有水印，可重新上传替换。</p></section>`
+}
+async function automationPage() {
+  taskLoadEpoch++
+  await saveCurrent()
+  releaseUrls()
+  schema = null
+  scheduled = null
+  view = 'automation'
+  if (!me.authenticated) {
+    automationReturn = true
+    shell(`<div class="empty-state">${icon('clock')}<h2>登录后管理自动签到</h2><p>使用原微信账号重新扫码，查看计划与当天待办。</p>${button('微信扫码登录', 'login', 'button primary')}</div>`)
+    return
+  }
+  const data = await request('/api/automations')
+  if (view !== 'automation' || schema)
+    return
+  const mailStates: Record<string, string> = {
+    pending: '等待发送',
+    sending: '发送中',
+    sent: '已发送',
+    failed: '发送失败',
+    unknown: '请检查收件箱',
+  }
+  shell(`<section class="page-heading compact"><div><div class="eyebrow">DAILY ROUTINES</div><h1>自动签到<span class="title-dot">.</span></h1><p>安排循环打卡，提前编辑每一天的待签到内容。</p></div>${button(`${icon('refresh')} 刷新状态`, 'nav-automation', 'button')}</section>
+    <div class="automatic-intro"><div>${icon('clock')}<strong>按北京时间执行</strong><p>默认 18:00，可为每个任务单独设置。每天默认复制本人昨日记录。</p></div><div>${icon('shield')}<strong>待办保存在本机</strong><p>关闭网页后继续运行；请保持本机服务运行。登录过期时等待重新扫码。</p></div><div>${icon('file')}<strong>${data.mail.configured ? '可选邮件通知' : '站内模式'}</strong><p>${data.mail.configured ? '填写邮箱可接收结果和续期提醒，也可以留空。' : '无需配置邮箱，结果、待办与登录状态都在这里查看。'}</p></div></div>
+    ${me.demo ? '<div class="notice demo-notice">演示计划只在本机模拟执行，不会发送真实签到或邮件。</div>' : ''}
+    <section class="automatic-list">${data.plans.length
+      ? data.plans.map((plan: JsonObject) => {
+          const today = plan.today as DailyCheckin | null
+          const status = plan.loginExpired
+            ? '等待重新登录'
+            : today ? runLabels[today.status] : '等待生成待办'
+          return `<article class="automatic-card"><div class="automatic-card-heading"><span class="task-icon blue">${icon('clock')}</span><div><span class="task-type">循环打卡 · ThreadId ${esc(plan.thread.id)}</span><h2>${esc(plan.thread.title)}</h2></div><span class="badge ${!plan.enabled || plan.loginExpired || today?.status === 'unknown' || today?.status === 'failed'
+            ? 'closed'
+            : ''}">${plan.enabled
+            ? esc(status)
+            : '已暂停'}</span></div>
+        <div class="automatic-facts"><div><span>每日计划时间</span><strong>${esc(plan.time)} <small>北京时间</small></strong></div><div><span>通知方式</span><strong>${plan.emailEnabled
+          ? esc(plan.recipient)
+          : '站内查看'}</strong></div><div><span>今日状态</span><strong>${esc(status)}</strong></div></div>
+        <p class="automatic-message">${esc(plan.loginExpired
+          ? '请使用原微信账号重新登录，恢复当天的签到。'
+          : today?.message || '打开待办即可填写或核对当天内容。')}</p>
+        <div class="automatic-card-actions">${plan.loginExpired
+          ? button(`${icon('wechat')} 重新扫码`, 'login', 'button primary')
+          : ''}${button(`${icon('edit')} ${plan.enabled ? '编辑下次待办' : '编辑并启动'}`, 'auto-open', 'button', `data-id="${esc(plan.id)}"`)}${today
+          ? button('查看今日内容', 'auto-open', 'text-button', `data-id="${esc(plan.id)}" data-date="${beijingDay()}"`)
+          : ''}${plan.enabled
+          ? button('暂停循环签到', 'auto-pause', 'text-button', `data-id="${esc(plan.id)}"`)
+          : ''}</div>
+        ${plan.recent.length
+          ? `<details class="automatic-records"><summary>最近签到记录</summary>${plan.recent.slice(0, 7).map((run: DailyCheckin) => `<div><time>${esc(run.date)}</time><span>${esc(runLabels[run.status])}</span><p>${esc(run.message)}</p></div>`).join('')}</details>`
+          : ''}</article>`
+        }).join('')
+      : `<div class="empty-state">${icon('clock')}<h2>安排你的第一个循环签到</h2><p>打开周期打卡任务，点击“启动循环签到”，核对内容后保存。</p>${button('查看我的任务', 'nav-tasks', 'button primary')}</div>`}</section>
+    ${data.notices.length
+      ? `<section class="automatic-mail-history"><h2>最近邮件通知</h2>${data.notices.map((notice: JsonObject) => `<div><span>${esc(notice.subject)}</span><span class="muted">${esc(mailStates[notice.state] || notice.state)}</span></div>`).join('')}</section>`
+      : ''}`)
+}
+async function useAutomatic(data: JsonObject) {
+  await saveCurrent()
+  releaseUrls()
+  taskLoadEpoch++
+  view = 'automation'
+  scheduled = {
+    plan: data.plan,
+    run: data.run,
+    editable: data.editable,
+    mailConfigured: !!data.mail?.configured,
+  }
+  schema = data.run.schema
+  draft = structuredClone(data.run.draft)
+  locals = []
+  watermark = watermarkDefaults()
+  prepared = null
+  submitted = false
+  savedAt = ''
+  selectedPreview = null
+  const setting = schema!.fields.find(field => field.FieldType === 25)?.WatermarkPhotoSetting
+  if (setting) {
+    const bits = Number(setting.AntiCheating?.WatermarkPhoto ?? 7)
+    watermark.showTime = !!(bits & 1)
+    watermark.showAddress = !!(bits & 2)
+    watermark.showCoordinates = !!(bits & 4)
+    watermark.title = setting.Title || ''
+  }
+  try {
+    const saved = await readDraft(draftKey())
+    if (data.editable && saved?.scheduleRevision === data.run.revision && saved.schemaHash === JSON.stringify(schema!.fields)) {
+      draft = saved.draft
+      locals = saved.locals
+      watermark = saved.watermark
+      scheduled.plan.time = saved.scheduleTime || scheduled.plan.time
+      scheduled.plan.recipient = saved.scheduleRecipient ?? scheduled.plan.recipient
+      scheduled.run.privacyAgreed = saved.schedulePrivacy ?? scheduled.run.privacyAgreed
+      toast('已恢复本机暂存内容，请保存到待办后生效')
+    }
+  }
+  catch { }
+  editorPage()
+  window.scrollTo(0, 0)
+}
+async function openAutomatic(id: string, date = '') {
+  await useAutomatic(await request(`/api/automations/${encodeURIComponent(id)}/draft${date
+    ? `?date=${date}`
+    : ''}`))
+}
+async function prepareAutomatic(enabled: boolean) {
+  if (!scheduled?.editable || !$<HTMLFormElement>('#editor-form').reportValidity())
+    return
+  await saveCurrent()
+  const privacyAgreed = !schema!.needPrivacy || $<HTMLInputElement>('#privacy-consent')?.checked === true
+  modal('准备待签到内容', '<div class="prepare-progress"><span class="spinner"></span><h3 id="prepare-progress">正在保存本机附件…</h3><p>确认后保存到待办，按计划执行。</p></div>')
+  const outgoing = await stageOutgoing()
+  pendingAutomatic = {
+    planId: scheduled.plan.id,
+    date: scheduled.run.date,
+    revision: scheduled.run.revision,
+    draft: outgoing,
+    time: scheduled.plan.time,
+    recipient: scheduled.plan.recipient,
+    enabled,
+    privacyAgreed,
+  }
+  const rows = outgoing.values.map(value => `<div class="review-row"><strong>${esc(schema!.fields.find(field => field.Id === value.FieldId)?.Name)}</strong><div>${value.Texts.map(text => `<span>${esc(text)}</span>`).join('')}${value.Files.map(file => `<span>${esc(file.Name || file.FileName || '本机附件')}</span>`).join('')}${value.Values.length && !value.Texts.length
+    ? `<span>${esc(value.Values.join('、'))}</span>`
+    : ''}</div></div>`).join('')
+  modal(enabled ? '确认循环签到安排' : '保存并暂停循环签到', `<div class="review-title"><span class="feature-icon">${icon('clock')}</span><div><h3>${esc(schema!.thread.title)}</h3><p>${esc(scheduled.run.date)} · ${esc(scheduled.plan.time)}（北京时间） · ${esc(draft.signature)}</p></div></div><div class="notice">${enabled ? '确认后启动循环签到。若已过设定时间，将在当天 23:00 前核对并提交；后续每天默认复制昨天的本人记录。' : '保存这份待办，并暂停后续自动提交。'}</div><div class="review-fields">${rows}</div><p class="field-tip">${scheduled.mailConfigured && /^[^\s@]+@[^\s@][^\s.@]*\.[^\s@]+$/.test(scheduled.plan.recipient)
+    ? '结果及登录续期提醒将发送到所填邮箱。'
+    : '当前使用站内模式，无需邮箱；请在网站查看结果和登录状态。'}</p>`, button('返回编辑', 'close-modal', 'button') + button(enabled ? '确认保存并启动' : '确认保存并暂停', 'auto-confirm-save', 'button primary'))
+}
+async function confirmAutomatic(el: HTMLButtonElement) {
+  if (!pendingAutomatic || !scheduled)
+    throw new Error('请重新核对待办。')
+  const body = pendingAutomatic
+  el.disabled = true
+  try {
+    const data = await request(`/api/automations/${body.planId}/save`, body)
+    clearTimeout(saveTimer)
+    await removeDraft(draftKey())
+    submitted = true
+    releaseUrls()
+    locals = []
+    scheduled.run = data.run
+    scheduled.plan = {
+      ...scheduled.plan,
+      time: body.time,
+      recipient: body.recipient,
+      enabled: body.enabled,
+    }
+    draft = structuredClone(data.run.draft)
+    schema = data.run.schema
+    savedAt = ''
+    closeModal()
+    editorPage()
+    toast(body.enabled ? '待办已保存，循环签到已启动' : '待办已保存，循环签到已暂停')
+  }
+  finally {
+    el.disabled = false
+  }
+}
 async function action(name: string, el: HTMLElement) {
+  if (name === 'nav-automation') {
+    await automationPage()
+    return
+  }
+  if (name === 'auto-start') {
+    const data = await request('/api/automations', { threadId: schema!.thread.id })
+    await useAutomatic(data)
+    return
+  }
+  if (name === 'auto-open') {
+    await openAutomatic(el.dataset.id!, el.dataset.date || '')
+    return
+  }
+  if (name === 'auto-other-day') {
+    await openAutomatic(scheduled!.plan.id, scheduled!.run.date === beijingDay()
+      ? beijingDay(1)
+      : beijingDay())
+    return
+  }
+  if (name === 'auto-refresh-form') {
+    const data = await request(`/api/automations/${scheduled!.plan.id}/refresh`, { date: scheduled!.run.date, revision: scheduled!.run.revision })
+    await removeDraft(draftKey())
+    submitted = true
+    await useAutomatic({
+      ...scheduled,
+      run: data.run,
+      mail: { configured: scheduled!.mailConfigured },
+    })
+    return
+  }
+  if (name === 'auto-save' || name === 'auto-save-paused') {
+    await prepareAutomatic(name === 'auto-save')
+    return
+  }
+  if (name === 'auto-confirm-save') {
+    await confirmAutomatic(el as HTMLButtonElement)
+    return
+  }
+  if (name === 'auto-pause') {
+    await request(`/api/automations/${el.dataset.id}/toggle`, { enabled: false })
+    toast('已暂停后续自动签到')
+    await automationPage()
+    return
+  }
   if (name === 'close-modal') {
     closeModal()
     return
@@ -770,7 +1053,7 @@ async function action(name: string, el: HTMLElement) {
     return
   }
   if (name === 'help') {
-    modal('使用工作台', `<div class="help-content"><h3>连接与选择任务</h3><p>微信扫码后，通过参与、发布或收藏查找接龙、签到与打卡。未出现在列表中的任务，可以粘贴链接直接打开。</p><h3>编辑照片与位置</h3><p>水印相机接受本地图片，按你的设置合成时间、地点和经纬度。关闭自动水印即可使用原图。位置字段支持编辑地址与坐标。</p><h3>编辑已有记录</h3><p>打开任务后选择“我的已有记录”。仅展示本人记录，可编辑状态由接龙管家返回。</p><h3>预览与提交</h3><p>准备预览会上传附件。确认后才发送表单；发生网络异常时，先在官网核对，避免重复提交。</p><h3>本地草稿</h3><p>输入内容与选中的文件保存在当前浏览器。清理浏览器数据会删除草稿，退出登录后旧草稿不会在新会话中显示。</p></div>`)
+    modal('使用工作台', `<div class="help-content"><h3>连接与选择任务</h3><p>微信扫码后，通过参与、发布或收藏查找接龙、签到与打卡。未出现在列表中的任务，可以粘贴链接直接打开。</p><h3>循环签到</h3><p>在周期打卡详情中点击“启动循环签到”，核对待办后保存。默认每日北京时间 18:00 执行，内容复制本人昨日记录，可单独修改今天或明天的待办。关闭网页仍会运行，请保持本机服务运行。</p><h3>登录续期与可选邮件</h3><p>邮箱和邮件服务均为可选。配置不完整时，结果只在站内显示。登录失效后重新扫码，可在当天设定时间至 23:00 之间核对并补交今日签到，不补交往日记录。</p><h3>编辑照片与位置</h3><p>水印相机接受本地图片，按你的设置合成时间、地点和经纬度。关闭自动水印即可使用原图。位置字段支持编辑地址与坐标。复用的照片保留原有水印，需要更新时可重新上传。</p><h3>编辑已有记录</h3><p>打开任务后选择“我的已有记录”。仅展示本人记录，可编辑状态由接龙管家返回。</p><h3>预览与提交</h3><p>准备预览会上传附件。确认后才发送表单；发生网络异常时，先在官网核对，避免重复提交。</p><h3>草稿与待办</h3><p>本机暂存位于当前浏览器；点击保存后，自动签到待办及附件保存在本机服务端，同一微信账号重新登录后仍可继续使用。</p></div>`)
     return
   }
   if (name === 'login') {
@@ -789,6 +1072,7 @@ async function action(name: string, el: HTMLElement) {
     await request('/api/auth/logout', {})
     releaseUrls()
     schema = null
+    scheduled = null
     me = await request('/api/auth/me')
     view = 'tasks'
     welcome()
@@ -982,7 +1266,15 @@ document.addEventListener('input', (e) => {
   }
   if (!schema)
     return
-  if (el.id === 'signature-input') {
+  if (scheduled && ['auto-time', 'auto-recipient'].includes(el.id)) {
+    scheduled.plan[el.id === 'auto-time'
+      ? 'time'
+      : 'recipient'] = el.value
+  }
+  else if (scheduled && el.id === 'privacy-consent') {
+    scheduled.run.privacyAgreed = el.checked
+  }
+  else if (el.id === 'signature-input') {
     draft.signature = el.value
   }
   else if (el.id === 'number-input') {
@@ -1098,19 +1390,35 @@ document.addEventListener('submit', (e) => {
   e.preventDefault()
 })
 document.addEventListener('auth-expired', () => {
+  if (me.expired)
+    return
+  me.expired = true
+  me.authenticated = false
+  automationReturn = view === 'automation'
   toast('登录已失效，请重新扫码。', true)
+  if (!$('#auth-banner'))
+    $('.topbar')?.insertAdjacentHTML('afterend', `<div id="auth-banner" class="notice auth-banner">登录已失效，循环签到等待重新登录。${button('微信扫码恢复', 'login', 'button')}</div>`)
 })
 window.addEventListener('pagehide', () => {
   void saveCurrent()
 })
 async function init() {
   me = await request('/api/auth/me')
-  if (me.authenticated)
-    await loadTasks()
-  else
+  if (me.authenticated) {
+    if (automationReturn)
+      await automationPage()
+    else
+      await loadTasks()
+  }
+  else {
     welcome()
+  }
 }
 void init().catch((e) => {
   welcome()
   toast(e.message, true)
 })
+setInterval(() => {
+  if (view === 'automation' && !schema && me.authenticated && !me.expired && !modalRoot.firstElementChild && document.visibilityState === 'visible')
+    void automationPage().catch(() => { })
+}, 30000)

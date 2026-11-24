@@ -37,11 +37,15 @@ export function mailSettings() {
   }
 }
 export function siteUrl() {
-  const value = process.env.BASE_URL || process.env.PUBLIC_ORIGIN || `http://127.0.0.1:${process.env.PORT || 3210}`
-  const url = new URL(value)
-  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password)
-    throw new AppError('BASE_URL 必须是可访问的网站地址。', 500)
-  return url.origin
+  for (const value of [process.env.BASE_URL, process.env.PUBLIC_ORIGIN]) {
+    try {
+      const url = new URL(value || '')
+      if (['http:', 'https:'].includes(url.protocol) && !url.username && !url.password)
+        return url.origin
+    }
+    catch { }
+  }
+  return `http://127.0.0.1:${Number(process.env.PORT) || 3210}`
 }
 function escapeHtml(value: string) {
   return value.replace(/[&<>"']/g, c => ({

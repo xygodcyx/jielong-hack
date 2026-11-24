@@ -135,6 +135,7 @@ async function routes(req: Request, url: URL, s: Session): Promise<Response> {
     const { owner: _, schema: __, privacyHash: ___, ...publicPlan } = plan
     return json({
       plan: publicPlan,
+      mail: mailSettings(),
       ...await automations.editableDaily(plan),
     })
   }
@@ -146,6 +147,7 @@ async function routes(req: Request, url: URL, s: Session): Promise<Response> {
       const { owner: _, schema: __, privacyHash: ___, ...publicPlan } = plan
       return json({
         plan: publicPlan,
+        mail: mailSettings(),
         ...await automations.editableDaily(plan, url.searchParams.get('date') || undefined),
       })
     }
