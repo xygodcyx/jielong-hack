@@ -6,7 +6,7 @@ import { Database } from 'bun:sqlite'
 
 export const localRoot = process.env.JIELONG_DATA_DIR || join(import.meta.dir, '../../.local')
 mkdirSync(localRoot, { recursive: true, mode: 0o700 })
-const db = new Database(join(localRoot, 'state.sqlite'), { create: true })
+export const db = new Database(join(localRoot, 'state.sqlite'), { create: true })
 chmodSync(join(localRoot, 'state.sqlite'), 0o600)
 db.exec(`PRAGMA journal_mode = WAL;
   CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, data TEXT NOT NULL, expires INTEGER NOT NULL);
