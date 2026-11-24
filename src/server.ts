@@ -5,8 +5,11 @@ import { join } from 'node:path'
 import process from 'node:process'
 import { api, AppError } from './lib/api.ts'
 import { manualThreadOwner, pollLogin, startLogin } from './lib/auth.ts'
+import { getPlan, recoverInterruptedCheckins } from './lib/automation-store.ts'
+import { automationMediaOwner, automations } from './lib/automations.ts'
 import { demoSchema, demoThreads } from './lib/demo.ts'
 import { createPayload, listThreads, loadSchema, records, validateDraft } from './lib/forms.ts'
+import { flushNotices, mailHistory, mailSettings, recoverInterruptedMail } from './lib/mail.ts'
 import { resolveFiles, stageMedia } from './lib/media.ts'
 import { addHistory, deleteSession, getMedia, getSession, history, manualThreads, saveManualThread, saveSession } from './lib/store.ts'
 import { parseThreadReference, resolveThreadId } from './lib/thread-reference.ts'
@@ -88,8 +91,14 @@ async function routes(req: Request, url: URL, s: Session): Promise<Response> {
   }
   if (path === '/api/auth/login' && req.method === 'POST')
     return json(await startLogin(s))
-  if (path === '/api/auth/poll' && req.method === 'POST')
-    return json(await pollLogin(s))
+  if (path === '/api/auth/poll' && req.method === 'POST') {
+    const result = await pollLogin(s)
+    if (result.status === 'success' && s.accountKey) {
+      await automations.registerLogin(s.accountKey, s)
+      void automations.tick().catch(() => console.warn('自动签到检查未完成，下次检查将继续。'))
+    }
+    return json(result)
+  }
   if (path === '/api/auth/qr' && req.method === 'GET') {
     if (!s.login || s.login.expiresAt < Date.now())
       throw new AppError('二维码已失效。', 410)
@@ -111,6 +120,51 @@ async function routes(req: Request, url: URL, s: Session): Promise<Response> {
     return json({ ok: true })
   }
   requireAuth(s)
+  if (path === '/api/automations' && req.method === 'GET') {
+    const owner = await manualThreadOwner(s)
+    return json({
+      plans: automations.list(owner),
+      mail: mailSettings(),
+      notices: mailHistory(owner),
+    })
+  }
+  if (path === '/api/automations' && req.method === 'POST') {
+    const body = await req.json()
+    const id = await resolveForSession(s, String(body.threadId || ''))
+    const plan = await automations.create(await manualThreadOwner(s), s, id)
+    const { owner: _, schema: __, privacyHash: ___, ...publicPlan } = plan
+    return json({
+      plan: publicPlan,
+      ...await automations.editableDaily(plan),
+    })
+  }
+  const automationMatch = path.match(/^\/api\/automations\/([a-f\d-]{36})\/(draft|save|toggle|refresh)$/)
+  if (automationMatch) {
+    const owner = await manualThreadOwner(s)
+    const plan = getPlan(automationMatch[1], owner)
+    if (automationMatch[2] === 'draft' && req.method === 'GET') {
+      const { owner: _, schema: __, privacyHash: ___, ...publicPlan } = plan
+      return json({
+        plan: publicPlan,
+        ...await automations.editableDaily(plan, url.searchParams.get('date') || undefined),
+      })
+    }
+    if (automationMatch[2] === 'save' && req.method === 'POST') {
+      const body = await req.json()
+      return json({ run: await automations.save(owner, s, plan.id, String(body.date || ''), body) })
+    }
+    if (automationMatch[2] === 'toggle' && req.method === 'POST') {
+      const body = await req.json()
+      if (typeof body.enabled !== 'boolean')
+        throw new AppError('请选择启动或暂停。')
+      await automations.toggle(owner, plan.id, body.enabled)
+      return json({ ok: true })
+    }
+    if (automationMatch[2] === 'refresh' && req.method === 'POST') {
+      const body = await req.json()
+      return json({ run: await automations.refresh(owner, s, plan.id, String(body.date || ''), body.revision) })
+    }
+  }
   if (path === '/api/threads' && req.method === 'GET') {
     const page = Math.max(1, Number(url.searchParams.get('page')) || 1)
     const type = Number(url.searchParams.get('listType') || 1)
@@ -147,7 +201,10 @@ async function routes(req: Request, url: URL, s: Session): Promise<Response> {
   }
   if (path === '/api/history' && req.method === 'GET') {
     return json({
-      items: history(s.id),
+      items: [
+        ...history(s.id),
+        ...history(automationMediaOwner(await manualThreadOwner(s))),
+      ].sort((a, b) => b.createdAt - a.createdAt).slice(0, 100),
     })
   }
   if (path === '/api/media' && req.method === 'POST') {
@@ -157,9 +214,11 @@ async function routes(req: Request, url: URL, s: Session): Promise<Response> {
       throw new AppError('请选择文件。')
     return json(await stageMedia(s.id, file))
   }
-  const mediaMatch = path.match(/^\/api\/media\/([a-f\d-]{36})$/)
+  const mediaMatch = path.match(/^\/api\/(media|automation-media)\/([a-f\d-]{36})$/)
   if (mediaMatch && req.method === 'GET') {
-    const media = getMedia(s.id, mediaMatch[1])
+    const media = getMedia(mediaMatch[1] === 'automation-media'
+      ? automationMediaOwner(await manualThreadOwner(s))
+      : s.id, mediaMatch[2])
     if (!media)
       throw new AppError('附件不存在。', 404)
     const headers = { 'content-type': media.mime, 'content-disposition': `inline; filename*=UTF-8''${encodeURIComponent(media.name)}`, 'cache-control': 'private, max-age=3600' }
@@ -373,6 +432,15 @@ async function start() {
       }
     },
   })
+  recoverInterruptedCheckins()
+  recoverInterruptedMail()
+  const tick = () => {
+    void automations.tick().catch(() => console.warn('自动签到检查未完成，下次检查将继续。'))
+    if (mailSettings().configured)
+      void flushNotices().catch(() => console.warn('邮件通知检查未完成。'))
+  }
+  setTimeout(tick, 1500)
+  setInterval(tick, 30000)
   console.warn(`接龙工作台已启动：http://${server.hostname}:${server.port}`)
 }
 void start().catch((error) => {

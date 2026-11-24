@@ -134,3 +134,42 @@ it('手动添加分类在服务重启后保留，重复添加不重复建档', a
   cookie = ownCookie
   expect((await call('/api/manual-threads')).data.threads).toHaveLength(1)
 }, 10000)
+
+it('自动签到计划默认暂停、无需邮箱，待办重启保留且隔离其他账号', async () => {
+  expect((await call('/api/automations', { threadId: 'demo-watermark' })).status).toBe(422)
+  const created = await call('/api/automations', { threadId: 'demo-checkin' })
+  expect(created.status).toBe(200)
+  expect(created.data.plan.enabled).toBe(false)
+  expect(created.data.run.source).toBe('empty')
+  expect(created.data.run.schema.base).toBeUndefined()
+  const id = created.data.plan.id
+  expect((await call(`/api/automations/${id}/toggle`, { enabled: true })).status).toBe(400)
+  const run = created.data.run
+  run.draft.values[0].Texts = ['持久化的明日阅读计划']
+  run.draft.values[1].Texts = [30]
+  const saved = await call(`/api/automations/${id}/save`, {
+    date: run.date,
+    revision: run.revision,
+    draft: run.draft,
+    enabled: false,
+    recipient: '',
+    time: '18:00',
+  })
+  expect(saved.status).toBe(200)
+  expect((await call(`/api/automations/${id}/save`, { date: run.date, revision: run.revision, draft: run.draft })).status).toBe(409)
+  child.kill()
+  await child.exited
+  await startServer()
+  const persisted = await call(`/api/automations/${id}/draft?date=${run.date}`)
+  expect(persisted.status).toBe(200)
+  expect(persisted.data.run.draft.values[0].Texts).toEqual(['持久化的明日阅读计划'])
+  const listed = await call('/api/automations')
+  expect(listed.data.plans).toHaveLength(1)
+  expect(listed.data.plans[0].owner).toBeUndefined()
+  expect(listed.data.plans[0].emailEnabled).toBe(false)
+  const ownCookie = cookie
+  await call('/api/auth/me', undefined, '')
+  await call('/api/auth/demo', {})
+  expect((await call(`/api/automations/${id}/draft`)).status).toBe(404)
+  cookie = ownCookie
+}, 10000)
