@@ -1,0 +1,6 @@
+node_modules/
+public/assets/
+.local/
+.env
+*.har
+.DS_Store

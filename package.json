@@ -1,0 +1,25 @@
+{
+  "name": "jielong-studio",
+  "type": "module",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "bun --watch src/server.ts",
+    "start": "bun src/server.ts",
+    "build": "bun build src/client/app.ts --outdir public/assets --target browser --minify",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix"
+  },
+  "dependencies": {
+    "sharp": "^0.34.4"
+  },
+  "devDependencies": {
+    "@antfu/eslint-config": "^10.0.0",
+    "@types/bun": "^1.3.0",
+    "eslint": "^10.13.0",
+    "eslint-plugin-format": "^2.0.1",
+    "typescript": "^5.9.3"
+  }
+}
