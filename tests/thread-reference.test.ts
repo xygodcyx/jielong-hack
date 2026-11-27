@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'bun:test'
+import { describe, expect, it } from 'vitest'
 import { parseThreadReference, resolveThreadId } from '../src/lib/thread-reference.ts'
 
 describe('任务链接与短 ID', () => {

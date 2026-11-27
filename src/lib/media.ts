@@ -1,12 +1,17 @@
 import type { Field, FormSchema, JsonObject } from '../shared.ts'
+import { execFile } from 'node:child_process'
 import { mkdirSync } from 'node:fs'
+import { readFile, unlink, writeFile } from 'node:fs/promises'
 import { extname, join } from 'node:path'
+import process from 'node:process'
+import { promisify } from 'node:util'
 import sharp from 'sharp'
 import { api, AppError, assertApi } from './api.ts'
 import { getMedia, localRoot, saveMedia } from './store.ts'
 
 const dir = join(localRoot, 'media')
 mkdirSync(dir, { recursive: true, mode: 0o700 })
+const execute = promisify(execFile)
 export async function stageMedia(owner: string, file: File) {
   if (!file.size || file.size > 100 * 1024 * 1024)
     throw new AppError('单个文件须大于 0，且不超过 100 MB。')
@@ -15,8 +20,7 @@ export async function stageMedia(owner: string, file: File) {
   const name = Array.from(file.name).map(c => c.charCodeAt(0) < 32 || '/\\'.includes(c)
     ? '_'
     : c).join('').slice(0, 180) || 'upload'
-  await Bun.write(path, file)
-  await Bun.file(path).stat()
+  await writeFile(path, new Uint8Array(await file.arrayBuffer()), { mode: 0o600 })
   let mediaType = 3
   let width = 0
   let height = 0
@@ -41,39 +45,33 @@ export async function stageMedia(owner: string, file: File) {
   catch {
     if (/^(?:image|video|audio)\//.test(file.type)) {
       if (file.type.startsWith('image/')) {
-        await Bun.file(path).delete()
+        await unlink(path)
         throw new AppError('图片无法识别，仅支持 JPEG、PNG、WebP、GIF、HEIC。')
       }
-      const probe = Bun.which(Bun.env.FFPROBE_PATH || 'ffprobe')
-      if (!probe) {
-        await Bun.file(path).delete()
-        throw new AppError('上传视频和音频需要安装 ffmpeg（包含 ffprobe）。', 422)
-      }
-      const proc = Bun.spawn([
-        probe,
-        '-v',
-        'error',
-        '-show_streams',
-        '-show_format',
-        '-of',
-        'json',
-        path,
-      ], { stdout: 'pipe', stderr: 'ignore' })
-      const timer = setTimeout(() => proc.kill(), 15000)
       let metadata: any
       try {
-        metadata = JSON.parse(await new Response(proc.stdout).text())
-        await proc.exited
+        const result = await execute(process.env.FFPROBE_PATH || 'ffprobe', [
+          '-v',
+          'error',
+          '-show_streams',
+          '-show_format',
+          '-of',
+          'json',
+          path,
+        ], { timeout: 15000, maxBuffer: 4 * 1024 * 1024 })
+        metadata = JSON.parse(result.stdout)
       }
-      catch { }
-      finally {
-        clearTimeout(timer)
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+          await unlink(path)
+          throw new AppError('上传视频和音频需要安装 ffmpeg（包含 ffprobe）。', 422)
+        }
       }
       const stream = metadata?.streams?.find((x: any) => x.codec_type === (file.type.startsWith('video/')
         ? 'video'
         : 'audio'))
       if (!stream) {
-        await Bun.file(path).delete()
+        await unlink(path)
         throw new AppError('媒体文件损坏或格式不支持。')
       }
       mediaType = file.type.startsWith('video/')
@@ -84,7 +82,7 @@ export async function stageMedia(owner: string, file: File) {
       height = Number(stream.height) || 0
       duration = Number(metadata.format?.duration || stream.duration) || 0
       if (!duration) {
-        await Bun.file(path).delete()
+        await unlink(path)
         throw new AppError('无法读取媒体时长。')
       }
     }
@@ -177,7 +175,9 @@ export async function uploadToCos(token: string, media: JsonObject, threadId: st
   }
   for (const [k, v] of Object.entries(fields))
     form.append(k, v)
-  form.append('file', new File([await Bun.file(media.path).arrayBuffer()], media.name, { type: media.mime }))
+  form.append('file', new File([
+    new Uint8Array(await readFile(media.path)),
+  ], media.name, { type: media.mime }))
   // 存储鉴权来自临时签名；此请求绝不携带账号 Authorization。
   const r = await fetcher(p.Host, {
     method: 'POST',

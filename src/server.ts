@@ -1,33 +1,30 @@
 import type { Session } from './lib/store.ts'
 import type { Draft, FormSchema, JsonObject } from './shared.ts'
 import { createHash } from 'node:crypto'
+import { createServer } from 'node:http'
 import { join } from 'node:path'
 import process from 'node:process'
+import { fileURLToPath } from 'node:url'
 import { api, AppError } from './lib/api.ts'
 import { authenticated, invalidateSessionAuth, manualThreadOwner, pollLogin, startLogin, syncSessionAuth } from './lib/auth.ts'
 import { getPlan, recoverInterruptedCheckins } from './lib/automation-store.ts'
 import { automationMediaOwner, automations } from './lib/automations.ts'
 import { demoSchema, demoThreads } from './lib/demo.ts'
 import { createPayload, listThreads, loadSchema, records, validateDraft } from './lib/forms.ts'
+import { fileResponse, handleNodeRequest } from './lib/http.ts'
 import { flushNotices, mailHistory, mailSettings, recoverInterruptedMail } from './lib/mail.ts'
 import { resolveFiles, stageMedia } from './lib/media.ts'
-import { addHistory, deleteSession, getMedia, getSession, history, manualThreads, saveManualThread, saveSession, sessionMaxAge } from './lib/store.ts'
+import { addHistory, db, deleteSession, getMedia, getSession, history, manualThreads, saveManualThread, saveSession, sessionMaxAge } from './lib/store.ts'
 import { parseThreadReference, resolveThreadId } from './lib/thread-reference.ts'
 
-const root = join(import.meta.dir, '..')
-async function buildClient() {
-  const build = await Bun.build({
-    entrypoints: [
-      join(root, 'src/client/app.ts'),
-    ],
-    outdir: join(root, 'public/assets'),
-    target: 'browser',
-    minify: process.env.NODE_ENV === 'production',
-  })
-  if (!build.success) {
-    console.error(build.logs)
-    process.exit(1)
-  }
+const root = fileURLToPath(new URL('../', import.meta.url))
+let stopping = false
+const backgroundJobs = new Set<Promise<unknown>>()
+function runBackground(work: () => Promise<unknown>, message: string) {
+  if (stopping)
+    return
+  const task = work().catch(() => console.warn(message)).finally(() => backgroundJobs.delete(task))
+  backgroundJobs.add(task)
 }
 const prepared = new Map<string, {
   owner: string
@@ -97,7 +94,7 @@ async function routes(req: Request, url: URL, s: Session): Promise<Response> {
     const result = await pollLogin(s)
     if (!wasSuccessful && result.status === 'success' && s.accountKey) {
       await automations.registerLogin(s.accountKey, s)
-      void automations.tick().catch(() => console.warn('自动签到检查未完成，下次检查将继续。'))
+      runBackground(() => automations.tick(), '自动签到检查未完成，下次检查将继续。')
     }
     return json(result)
   }
@@ -219,14 +216,14 @@ async function routes(req: Request, url: URL, s: Session): Promise<Response> {
     return json(await stageMedia(s.id, file))
   }
   const mediaMatch = path.match(/^\/api\/(media|automation-media)\/([a-f\d-]{36})$/)
-  if (mediaMatch && req.method === 'GET') {
+  if (mediaMatch && (req.method === 'GET' || req.method === 'HEAD')) {
     const media = getMedia(mediaMatch[1] === 'automation-media'
       ? automationMediaOwner(await manualThreadOwner(s))
       : s.id, mediaMatch[2])
     if (!media)
       throw new AppError('附件不存在。', 404)
     const headers = { 'content-type': media.mime, 'content-disposition': `inline; filename*=UTF-8''${encodeURIComponent(media.name)}`, 'cache-control': 'private, max-age=3600' }
-    return new Response(Bun.file(media.path), { headers })
+    return fileResponse(media.path, req, headers)
   }
   const match = path.match(/^\/api\/threads\/([^/]+)\/(form|records|prepare|submit)$/)
   if (match) {
@@ -356,106 +353,138 @@ async function routes(req: Request, url: URL, s: Session): Promise<Response> {
   }
   throw new AppError('接口不存在。', 404)
 }
-async function start() {
-  await buildClient()
-  const server = Bun.serve({
-    hostname: process.env.HOST || '127.0.0.1',
-    port: Number(process.env.PORT) || 3210,
-    maxRequestBodySize: 105 * 1024 * 1024,
-    idleTimeout: 90,
-    async fetch(req) {
-      const url = new URL(req.url)
-      const headers: Record<string, string> = {
-        'x-content-type-options': 'nosniff',
-        'referrer-policy': 'no-referrer',
-        'content-security-policy': 'default-src \'self\'; script-src \'self\'; style-src \'self\' \'unsafe-inline\'; img-src \'self\' blob: data: https:; media-src \'self\' blob: https:; connect-src \'self\'; object-src \'none\'; base-uri \'self\'; frame-ancestors \'none\'; form-action \'self\'',
+async function handleRequest(req: Request) {
+  const url = new URL(req.url)
+  const headers: Record<string, string> = {
+    'x-content-type-options': 'nosniff',
+    'referrer-policy': 'no-referrer',
+    'content-security-policy': 'default-src \'self\'; script-src \'self\'; style-src \'self\' \'unsafe-inline\'; img-src \'self\' blob: data: https:; media-src \'self\' blob: https:; connect-src \'self\'; object-src \'none\'; base-uri \'self\'; frame-ancestors \'none\'; form-action \'self\'',
+  }
+  let cookie = ''
+  try {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      const origin = req.headers.get('origin')
+      if (origin !== (process.env.PUBLIC_ORIGIN || url.origin))
+        throw new AppError('请求来源不匹配，请从网站内操作。', 403)
+    }
+    let response: Response
+    if (url.pathname.startsWith('/api/')) {
+      const sid = req.headers.get('cookie')?.match(/(?:^|;\s*)jielong_session=([a-f\d-]{36})/)?.[1]
+      let s = sid
+        ? getSession(sid)
+        : null
+      if (!s) {
+        s = {
+          id: crypto.randomUUID(),
+          expire: Date.now() + 7 * 86400000,
+        }
+        saveSession(s)
       }
-      let cookie = ''
+      syncSessionAuth(s)
+      cookie = `jielong_session=${s.id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${sessionMaxAge}${process.env.PUBLIC_ORIGIN?.startsWith('https:')
+        ? '; Secure'
+        : ''}`
       try {
-        if (req.method !== 'GET' && req.method !== 'HEAD') {
-          const origin = req.headers.get('origin')
-          if (origin !== (process.env.PUBLIC_ORIGIN || url.origin))
-            throw new AppError('请求来源不匹配，请从网站内操作。', 403)
-        }
-        let response: Response
-        if (url.pathname.startsWith('/api/')) {
-          const sid = req.headers.get('cookie')?.match(/(?:^|;\s*)jielong_session=([a-f\d-]{36})/)?.[1]
-          let s = sid
-            ? getSession(sid)
-            : null
-          if (!s) {
-            s = {
-              id: crypto.randomUUID(),
-              expire: Date.now() + 7 * 86400000,
-            }
-            saveSession(s)
-          }
-          syncSessionAuth(s)
-          cookie = `jielong_session=${s.id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${sessionMaxAge}${process.env.PUBLIC_ORIGIN?.startsWith('https:')
-            ? '; Secure'
-            : ''}`
-          try {
-            response = await routes(req, url, s)
-          }
-          catch (error) {
-            if (!url.pathname.startsWith('/api/auth/') && error instanceof AppError && error.code === 'AUTH_REQUIRED')
-              invalidateSessionAuth(s)
-            throw error
-          }
-          if (url.pathname === '/api/auth/logout' && req.method === 'POST')
-            cookie = cookie.replace(`Max-Age=${sessionMaxAge}`, 'Max-Age=0')
-        }
-        else if (req.method === 'GET' || req.method === 'HEAD') {
-          const files: Record<string, string> = {
-            '/': 'index.html',
-            '/styles.css': 'styles.css',
-            '/assets/app.js': 'assets/app.js',
-            '/favicon.svg': 'favicon.svg',
-            '/watermark-logo.webp': 'watermark-logo.webp',
-          }
-          const path = files[url.pathname]
-          if (!path)
-            throw new AppError('页面不存在。', 404)
-          response = new Response(Bun.file(join(root, 'public', path)), {
-            headers: { 'cache-control': 'no-cache' },
-          })
-        }
-        else {
-          throw new AppError('请求方法不支持。', 405)
-        }
-        for (const [key, value] of Object.entries(headers))
-          response.headers.set(key, value)
-        if (cookie)
-          response.headers.set('set-cookie', cookie)
-        return response
+        response = await routes(req, url, s)
       }
-      catch (e) {
-        const err = e instanceof AppError
-          ? e
-          : new AppError(e instanceof SyntaxError
-              ? '请求数据格式错误。'
-              : '处理失败，请重试。', e instanceof SyntaxError
-              ? 400
-              : 500)
-        const response = json({ error: err.message, code: err.code }, err.status)
-        for (const [key, value] of Object.entries(headers))
-          response.headers.set(key, value)
-        if (cookie)
-          response.headers.set('set-cookie', cookie)
-        return response
+      catch (error) {
+        if (!url.pathname.startsWith('/api/auth/') && error instanceof AppError && error.code === 'AUTH_REQUIRED')
+          invalidateSessionAuth(s)
+        throw error
       }
-    },
+      if (url.pathname === '/api/auth/logout' && req.method === 'POST')
+        cookie = cookie.replace(`Max-Age=${sessionMaxAge}`, 'Max-Age=0')
+    }
+    else if (req.method === 'GET' || req.method === 'HEAD') {
+      const files: Record<string, string> = {
+        '/': 'index.html',
+        '/styles.css': 'styles.css',
+        '/assets/app.js': 'assets/app.js',
+        '/favicon.svg': 'favicon.svg',
+        '/watermark-logo.webp': 'watermark-logo.webp',
+      }
+      const path = files[url.pathname]
+      if (!path)
+        throw new AppError('页面不存在。', 404)
+      response = await fileResponse(join(root, 'public', path), req, { 'cache-control': 'no-cache' })
+    }
+    else {
+      throw new AppError('请求方法不支持。', 405)
+    }
+    for (const [key, value] of Object.entries(headers))
+      response.headers.set(key, value)
+    if (cookie)
+      response.headers.set('set-cookie', cookie)
+    return response
+  }
+  catch (e) {
+    const err = e instanceof AppError
+      ? e
+      : new AppError(e instanceof SyntaxError
+          ? '请求数据格式错误。'
+          : '处理失败，请重试。', e instanceof SyntaxError
+          ? 400
+          : 500)
+    const response = json({ error: err.message, code: err.code }, err.status)
+    for (const [key, value] of Object.entries(headers))
+      response.headers.set(key, value)
+    if (cookie)
+      response.headers.set('set-cookie', cookie)
+    return response
+  }
+}
+async function start() {
+  const activeRequests = new Set<Promise<void>>()
+  const server = createServer((request, response) => {
+    const task = handleNodeRequest(request, response, handleRequest)
+      .catch(() => { response.destroy() })
+      .finally(() => activeRequests.delete(task))
+    activeRequests.add(task)
+  })
+  server.requestTimeout = 90000
+  server.timeout = 90000
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(Number(process.env.PORT) || 3210, process.env.HOST || '127.0.0.1', resolve)
   })
   recoverInterruptedCheckins()
   recoverInterruptedMail()
   const tick = () => {
-    void automations.tick().catch(() => console.warn('自动签到检查未完成，下次检查将继续。'))
+    runBackground(() => automations.tick(), '自动签到检查未完成，下次检查将继续。')
     if (mailSettings().configured)
-      void flushNotices().catch(() => console.warn('邮件通知检查未完成。'))
+      runBackground(() => flushNotices(), '邮件通知检查未完成。')
   }
-  setTimeout(tick, 1500)
-  setInterval(tick, 30000)
-  console.warn(`接龙工作台已启动：http://${server.hostname}:${server.port}`)
+  const firstTick = setTimeout(tick, 1500)
+  const interval = setInterval(tick, 30000)
+  const shutdown = async () => {
+    if (stopping)
+      return
+    stopping = true
+    clearTimeout(firstTick)
+    clearInterval(interval)
+    const deadline = setTimeout(() => {
+      console.warn('退出等待超过 60 秒，保留执行状态，下次启动时核对。')
+      server.closeAllConnections()
+      process.exit(1)
+    }, 60000)
+    await new Promise<void>(resolve => server.close(() => resolve()))
+    await Promise.allSettled([
+      ...activeRequests,
+      ...backgroundJobs,
+    ])
+    clearTimeout(deadline)
+    db.close()
+    process.exit(0)
+  }
+  const stop = () => {
+    void shutdown().catch(() => process.exit(1))
+  }
+  process.once('SIGINT', stop)
+  process.once('SIGTERM', stop)
+  const address = server.address()
+  if (address && typeof address !== 'string')
+    console.warn(`接龙工作台已启动：http://${address.address}:${address.port}`)
+  process.send?.('ready')
 }
 void start().catch((error) => {
   console.error(error)

@@ -1,9 +1,12 @@
+import { spawn } from 'node:child_process'
 import process from 'node:process'
-import { Database } from 'bun:sqlite'
-import { afterAll, beforeAll, expect, it } from 'bun:test'
+import { DatabaseSync } from 'node:sqlite'
+import { fileURLToPath } from 'node:url'
 import sharp from 'sharp'
+import { afterAll, beforeAll, expect, it } from 'vitest'
 
-let child: ReturnType<typeof Bun.spawn>
+let child: ReturnType<typeof spawn>
+let childExited: Promise<number | null>
 let cookie = ''
 const origin = 'http://127.0.0.1:43210'
 async function call(path: string, body?: unknown, session = cookie) {
@@ -35,8 +38,8 @@ async function call(path: string, body?: unknown, session = cookie) {
   }
 }
 async function startServer() {
-  child = Bun.spawn(['bun', 'src/server.ts'], {
-    cwd: `${import.meta.dir}/..`,
+  child = spawn(process.execPath, ['--env-file-if-exists=.env', '--enable-source-maps', 'dist/server.js'], {
+    cwd: fileURLToPath(new URL('../', import.meta.url)),
     env: {
       ...process.env,
       HOST: '127.0.0.1',
@@ -49,25 +52,40 @@ async function startServer() {
       TO_EMAIL: '',
       JIELONG_DATA_DIR: `${process.env.JIELONG_DATA_DIR}/integration`,
     },
-    stdout: 'ignore',
-    stderr: 'pipe',
+    stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
   })
-  for (let i = 0; i < 50; i++) {
-    try {
-      await call('/api/auth/me')
-      return
-    }
-    catch {
-      await Bun.sleep(100)
-    }
-  }
-  throw new Error('测试服务未能启动')
+  childExited = new Promise(resolve => child.once('exit', resolve))
+  let errors = ''
+  child.stderr!.on('data', (chunk) => {
+    errors += String(chunk).slice(0, 10000)
+  })
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('测试服务未能启动')), 5000)
+    child.once('error', (error) => {
+      clearTimeout(timeout)
+      reject(error)
+    })
+    child.once('exit', () => {
+      clearTimeout(timeout)
+      reject(new Error(`测试服务提前退出：${errors}`))
+    })
+    child.once('message', (message) => {
+      if (message === 'ready') {
+        clearTimeout(timeout)
+        resolve()
+      }
+    })
+  })
+  await call('/api/auth/me')
+}
+async function stopServer() {
+  if (!child)
+    return
+  child.kill('SIGTERM')
+  expect(await childExited).toBe(0)
 }
 beforeAll(startServer, 10000)
-afterAll(async () => {
-  child?.kill()
-  await child?.exited
-})
+afterAll(stopServer)
 it('完整演示流程：隔离会话、校验、生成预览、确认提交、重复提交去重', async () => {
   expect((await call('/api/threads')).status).toBe(401)
   await call('/api/auth/demo', {})
@@ -137,8 +155,7 @@ it('手动添加分类在服务重启后保留，重复添加不重复建档', a
   expect(first.data.form.thread.title).toBe('校园日常签到')
   await call('/api/manual-threads', { value: 'demo-watermark' })
   expect((await call('/api/manual-threads')).data.page.TotalRecords).toBe(1)
-  child.kill()
-  await child.exited
+  await stopServer()
   await startServer()
   const saved = await call('/api/manual-threads')
   expect(saved.status).toBe(200)
@@ -173,8 +190,7 @@ it('自动签到计划默认暂停、无需邮箱，待办重启保留且隔离�
   })
   expect(saved.status).toBe(200)
   expect((await call(`/api/automations/${id}/save`, { date: run.date, revision: run.revision, draft: run.draft })).status).toBe(409)
-  child.kill()
-  await child.exited
+  await stopServer()
   await startServer()
   const persisted = await call(`/api/automations/${id}/draft?date=${run.date}`)
   expect(persisted.status).toBe(200)
@@ -192,7 +208,7 @@ it('自动签到计划默认暂停、无需邮箱，待办重启保留且隔离�
 
 it('两地登录共享最新凭证，过期设备保留身份，重启可恢复且主动退出只撤销当前设备', async () => {
   const ownCookie = cookie
-  const database = new Database(`${process.env.JIELONG_DATA_DIR}/integration/state.sqlite`)
+  const database = new DatabaseSync(`${process.env.JIELONG_DATA_DIR}/integration/state.sqlite`)
   const owner = 'wechat:fixture-shared-login'
   const first = {
     id: crypto.randomUUID(),
@@ -213,15 +229,15 @@ it('两地登录共享最新凭证，过期设备保留身份，重启可恢复�
   const secondCookie = `jielong_session=${second.id}`
   try {
     for (const s of [first, second])
-      database.query('INSERT INTO sessions VALUES (?,?,?)').run(s.id, JSON.stringify(s), s.expire)
-    database.query('INSERT INTO automation_accounts VALUES (?,?)').run(owner, JSON.stringify(first))
+      database.prepare('INSERT INTO sessions VALUES (?,?,?)').run(s.id, JSON.stringify(s), s.expire)
+    database.prepare('INSERT INTO automation_accounts VALUES (?,?)').run(owner, JSON.stringify(first))
     const expired = await call('/api/auth/me', undefined, firstCookie)
     expect(expired.data.authenticated).toBe(false)
     expect(expired.data.expired).toBe(true)
     expect(cookie).toBe(firstCookie)
     expect((await call('/api/manual-threads', undefined, firstCookie)).status).toBe(401)
 
-    database.query('UPDATE automation_accounts SET data=? WHERE owner=?').run(JSON.stringify(second), owner)
+    database.prepare('UPDATE automation_accounts SET data=? WHERE owner=?').run(JSON.stringify(second), owner)
     const restored = await call('/api/auth/me', undefined, firstCookie)
     expect(restored.data.authenticated).toBe(true)
     expect(restored.data.expired).toBe(false)
@@ -231,12 +247,11 @@ it('两地登录共享最新凭证，过期设备保留身份，重启可恢复�
     expect(restored.setCookie).toContain('Max-Age=31536000')
     expect(JSON.stringify(restored.data)).not.toContain(second.token)
     expect((await call('/api/manual-threads', undefined, firstCookie)).status).toBe(200)
-    const persisted = database.query('SELECT data FROM sessions WHERE id=?').get(first.id) as { data: string }
+    const persisted = database.prepare('SELECT data FROM sessions WHERE id=?').get(first.id) as { data: string }
     expect(JSON.parse(persisted.data).token).toBe(second.token)
     expect((await call('/api/auth/poll', {}, secondCookie)).data.status).toBe('success')
 
-    child.kill()
-    await child.exited
+    await stopServer()
     await startServer()
     expect((await call('/api/auth/me', undefined, firstCookie)).data.authenticated).toBe(true)
     const logout = await call('/api/auth/logout', {}, firstCookie)

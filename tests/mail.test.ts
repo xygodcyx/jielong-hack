@@ -1,4 +1,4 @@
-import { expect, it } from 'bun:test'
+import { expect, it } from 'vitest'
 import { flushNotices, mailHistory, queueNotice, recoverInterruptedMail, renderNotice, validEmail } from '../src/lib/mail.ts'
 import { db } from '../src/lib/store.ts'
 
@@ -41,7 +41,7 @@ it('重启不重复发送结果不明的邮件；模板转义正文，拒绝邮�
     subject: 'test',
     lines: ['a & b'],
   })
-  db.query('UPDATE mail_outbox SET state=\'sending\' WHERE id=?').run(owner)
+  db.prepare('UPDATE mail_outbox SET state=\'sending\' WHERE id=?').run(owner)
   recoverInterruptedMail()
   expect(mailHistory(owner)[0]?.state).toBe('unknown')
   const rendered = renderNotice({

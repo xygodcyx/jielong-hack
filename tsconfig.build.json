@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "noEmit": false,
+    "outDir": "dist",
+    "rewriteRelativeImportExtensions": true,
+    "sourceMap": true
+  },
+  "include": ["src/server.ts", "src/shared.ts", "src/automation-shared.ts", "src/lib/**/*.ts"],
+  "exclude": ["src/client", "tests"]
+}

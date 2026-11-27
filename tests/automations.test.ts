@@ -2,7 +2,7 @@ import type { AutomationDependencies } from '../src/lib/automations.ts'
 import type { Session } from '../src/lib/store.ts'
 import type { JsonObject } from '../src/shared.ts'
 import process from 'node:process'
-import { afterEach, expect, it } from 'bun:test'
+import { afterEach, expect, it } from 'vitest'
 import { AppError } from '../src/lib/api.ts'
 import { automationAccount, dailyCheckin, getPlan, plans, recoverInterruptedCheckins, saveAutomationAccount, savePlan, updateDailyCheckin } from '../src/lib/automation-store.ts'
 import { automationMediaOwner, AutomationService } from '../src/lib/automations.ts'
@@ -15,7 +15,7 @@ const stamp = (time: string) => Date.parse(`2026-11-24T${time}:00+08:00`)
 afterEach(() => {
   for (const plan of plans())
     savePlan({ ...plan, enabled: false })
-  db.query('DELETE FROM mail_outbox WHERE owner LIKE \'test-automation:%\'').run()
+  db.prepare('DELETE FROM mail_outbox WHERE owner LIKE \'test-automation:%\'').run()
 })
 async function fixture(overrides: Partial<AutomationDependencies> = {}) {
   let now = stamp('17:00')

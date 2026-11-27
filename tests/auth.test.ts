@@ -1,5 +1,5 @@
 import type { Session } from '../src/lib/store.ts'
-import { expect, it } from 'bun:test'
+import { expect, it } from 'vitest'
 import { accountKey, authenticated, invalidateSessionAuth, pollLogin, startLogin, syncSessionAuth } from '../src/lib/auth.ts'
 import { automationAccount, invalidateAutomationAccount, saveAutomationAccount } from '../src/lib/automation-store.ts'
 import { AutomationService } from '../src/lib/automations.ts'
@@ -22,7 +22,7 @@ function fixture() {
 
 it('旧版会话的 Token 过期后仍记住账号，并复用其他设备最后扫码取得的凭证', async () => {
   const { owner, session } = fixture()
-  db.query('INSERT INTO sessions VALUES (?,?,?)').run(session.id, JSON.stringify(session), session.expire)
+  db.prepare('INSERT INTO sessions VALUES (?,?,?)').run(session.id, JSON.stringify(session), session.expire)
   const remembered = getSession(session.id)!
   expect(remembered.accountKey).toBe(owner)
   expect(authenticated(remembered)).toBe(false)

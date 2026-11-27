@@ -1,4 +1,4 @@
-import { expect, it } from 'bun:test'
+import { expect, it } from 'vitest'
 import { accountKey, manualThreadOwner } from '../src/lib/auth.ts'
 import { demoThreads } from '../src/lib/demo.ts'
 import { manualThreads, saveManualThread } from '../src/lib/store.ts'

@@ -1,17 +1,16 @@
 import type { JsonObject, RecordValue } from '../src/shared.ts'
-import { afterEach, describe, expect, it, spyOn } from 'bun:test'
+import { writeFile } from 'node:fs/promises'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { api, assertApi } from '../src/lib/api.ts'
 import { demoSchema } from '../src/lib/demo.ts'
 import { createPayload, listThreads, loadSchema, validateDraft } from '../src/lib/forms.ts'
 import { uploadHostAllowed, uploadToCos, validateMedia } from '../src/lib/media.ts'
 
-let fetchSpy: ReturnType<typeof spyOn> | undefined
+let fetchSpy: { mockRestore: () => void } | undefined
 afterEach(() => fetchSpy?.mockRestore())
 const success = (Data: unknown) => Response.json({ Type: '000001', Data })
 function mockFetch(implementation: (url: RequestInfo | URL) => Promise<Response>) {
-  fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(Object.assign(implementation, {
-    preconnect: () => { },
-  }) as typeof fetch)
+  fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(implementation)
 }
 describe('接龙和打卡协议', () => {
   it('默认仅使用官方支持的参与列表枚举，并保留原始分页', async () => {
@@ -173,7 +172,7 @@ describe('表单验证与媒体上传', () => {
   it('使用新 COS 凭证，存储上传不携带登录 Authorization', async () => {
     const { localRoot } = await import('../src/lib/store.ts')
     const path = `${localRoot}/fixture.jpg`
-    await Bun.write(path, 'fixture-bytes')
+    await writeFile(path, 'fixture-bytes')
     const calls: {
       url: string
       options: RequestInit

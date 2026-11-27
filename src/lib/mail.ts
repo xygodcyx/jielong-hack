@@ -11,12 +11,6 @@ export interface Notice {
   actionLabel?: string
   actionUrl?: string
 }
-interface QueuedMail extends Notice {
-  id: string
-  owner: string
-  recipient: string
-  attempts: number
-}
 db.exec(`CREATE TABLE IF NOT EXISTS mail_outbox (
   id TEXT PRIMARY KEY, owner TEXT NOT NULL, recipient TEXT NOT NULL,
   data TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
@@ -94,7 +88,7 @@ export async function sendNotice(recipient: string, notice: Notice) {
   })
 }
 export function queueNotice(id: string, owner: string, recipient: string, notice: Notice, now = Date.now()) {
-  db.query('INSERT OR IGNORE INTO mail_outbox (id,owner,recipient,data,next_at,updated) VALUES (?,?,?,?,?,?)')
+  db.prepare('INSERT OR IGNORE INTO mail_outbox (id,owner,recipient,data,next_at,updated) VALUES (?,?,?,?,?,?)')
     .run(id, owner, validEmail(recipient), JSON.stringify(notice), now, now)
 }
 let flushing = false
@@ -103,18 +97,18 @@ export async function flushNotices(now = Date.now(), send = sendNotice) {
     return
   flushing = true
   try {
-    const rows = db.query('SELECT id,owner,recipient,data,attempts FROM mail_outbox WHERE state=\'pending\' AND next_at<=? ORDER BY next_at LIMIT 10').all(now) as (QueuedMail & { data: string })[]
+    const rows = db.prepare('SELECT id,owner,recipient,data,attempts FROM mail_outbox WHERE state=\'pending\' AND next_at<=? ORDER BY next_at LIMIT 10').all(now) as { id: string, owner: string, recipient: string, data: string, attempts: number }[]
     for (const row of rows) {
-      const claimed = db.query('UPDATE mail_outbox SET state=\'sending\',attempts=attempts+1,updated=? WHERE id=? AND state=\'pending\'').run(now, row.id)
+      const claimed = db.prepare('UPDATE mail_outbox SET state=\'sending\',attempts=attempts+1,updated=? WHERE id=? AND state=\'pending\'').run(now, row.id)
       if (!claimed.changes)
         continue
       try {
         await send(row.recipient, JSON.parse(row.data))
-        db.query('UPDATE mail_outbox SET state=\'sent\',updated=?,error=\'\' WHERE id=?').run(now, row.id)
+        db.prepare('UPDATE mail_outbox SET state=\'sent\',updated=?,error=\'\' WHERE id=?').run(now, row.id)
       }
       catch {
         // 不把 SMTP 响应或凭证写入网页/日志；失败退避，最多尝试五次。
-        db.query('UPDATE mail_outbox SET state=?,next_at=?,updated=?,error=? WHERE id=?')
+        db.prepare('UPDATE mail_outbox SET state=?,next_at=?,updated=?,error=? WHERE id=?')
           .run(row.attempts >= 4
             ? 'failed'
             : 'pending', now + Math.min(3600000, 600000 * 2 ** row.attempts), now, '邮件未发送成功，请检查 SMTP 配置与邮箱。', row.id)
@@ -126,10 +120,10 @@ export async function flushNotices(now = Date.now(), send = sendNotice) {
   }
 }
 export function mailHistory(owner: string) {
-  return (db.query('SELECT id,data,state,attempts,updated,error FROM mail_outbox WHERE owner=? ORDER BY updated DESC LIMIT 20').all(owner) as { id: string, data: string, state: string, attempts: number, updated: number, error: string }[])
+  return (db.prepare('SELECT id,data,state,attempts,updated,error FROM mail_outbox WHERE owner=? ORDER BY updated DESC LIMIT 20').all(owner) as { id: string, data: string, state: string, attempts: number, updated: number, error: string }[])
     .map(({ data, ...row }) => ({ ...row, subject: (JSON.parse(data) as Notice).subject }))
 }
 export function recoverInterruptedMail() {
   // SMTP 可能已接收邮件，重启时不重复发送结果不明的那一封。
-  db.query('UPDATE mail_outbox SET state=\'unknown\',error=? WHERE state=\'sending\'').run('服务在发送邮件时重启，请检查收件箱。')
+  db.prepare('UPDATE mail_outbox SET state=\'unknown\',error=? WHERE state=\'sending\'').run('服务在发送邮件时重启，请检查收件箱。')
 }

@@ -8,7 +8,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS automation_accounts (owner TEXT PRIMARY KEY,
   CREATE TABLE IF NOT EXISTS daily_checkins (plan_id TEXT NOT NULL, date TEXT NOT NULL, data TEXT NOT NULL, status TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(plan_id,date));`)
 
 export function automationAccount(owner: string): Session | null {
-  const row = db.query('SELECT data FROM automation_accounts WHERE owner=?').get(owner) as { data: string } | null
+  const row = db.prepare('SELECT data FROM automation_accounts WHERE owner=?').get(owner) as { data: string } | null
   return row
     ? JSON.parse(row.data)
     : null
@@ -19,7 +19,7 @@ export function saveAutomationAccount(owner: string, session: Session, force = f
   if (!force && old)
     return
   const { login: _, ...safe } = session
-  db.query('INSERT OR REPLACE INTO automation_accounts VALUES (?,?)').run(owner, JSON.stringify(safe))
+  db.prepare('INSERT OR REPLACE INTO automation_accounts VALUES (?,?)').run(owner, JSON.stringify(safe))
 }
 export function invalidateAutomationAccount(owner: string, token?: string) {
   const account = automationAccount(owner)
@@ -28,40 +28,40 @@ export function invalidateAutomationAccount(owner: string, token?: string) {
 }
 export function plans(owner?: string): CheckinPlan[] {
   const rows = owner
-    ? db.query('SELECT data FROM checkin_plans WHERE owner=? ORDER BY rowid DESC').all(owner)
-    : db.query('SELECT data FROM checkin_plans ORDER BY rowid').all()
+    ? db.prepare('SELECT data FROM checkin_plans WHERE owner=? ORDER BY rowid DESC').all(owner)
+    : db.prepare('SELECT data FROM checkin_plans ORDER BY rowid').all()
   return (rows as { data: string }[]).map(row => JSON.parse(row.data))
 }
 export function getPlan(id: string, owner?: string): CheckinPlan {
-  const row = db.query('SELECT owner,data FROM checkin_plans WHERE id=?').get(id) as { data: string, owner: string } | null
+  const row = db.prepare('SELECT owner,data FROM checkin_plans WHERE id=?').get(id) as { data: string, owner: string } | null
   if (!row || (owner && owner !== row.owner))
     throw new AppError('自动签到计划不存在。', 404)
   return JSON.parse(row.data)
 }
 export function savePlan(plan: CheckinPlan) {
-  db.query('INSERT INTO checkin_plans VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data')
+  db.prepare('INSERT INTO checkin_plans VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data')
     .run(plan.id, plan.owner, plan.thread.id, JSON.stringify(plan))
 }
 export function dailyCheckin(planId: string, date: string): DailyCheckin | null {
-  const row = db.query('SELECT data FROM daily_checkins WHERE plan_id=? AND date=?').get(planId, date) as { data: string } | null
+  const row = db.prepare('SELECT data FROM daily_checkins WHERE plan_id=? AND date=?').get(planId, date) as { data: string } | null
   return row
     ? JSON.parse(row.data)
     : null
 }
 export function insertDailyCheckin(run: DailyCheckin) {
-  db.query('INSERT OR IGNORE INTO daily_checkins VALUES (?,?,?,?,?)').run(run.planId, run.date, JSON.stringify(run), run.status, run.revision)
+  db.prepare('INSERT OR IGNORE INTO daily_checkins VALUES (?,?,?,?,?)').run(run.planId, run.date, JSON.stringify(run), run.status, run.revision)
   return dailyCheckin(run.planId, run.date)!
 }
 export function updateDailyCheckin(run: DailyCheckin, expectedRevision = run.revision) {
   const updated = { ...run, revision: expectedRevision + 1 }
-  const result = db.query('UPDATE daily_checkins SET data=?,status=?,revision=? WHERE plan_id=? AND date=? AND revision=?')
+  const result = db.prepare('UPDATE daily_checkins SET data=?,status=?,revision=? WHERE plan_id=? AND date=? AND revision=?')
     .run(JSON.stringify(updated), updated.status, updated.revision, run.planId, run.date, expectedRevision)
   if (!result.changes)
     throw new AppError('这份待签到内容已被更新，请刷新后再编辑。', 409)
   return updated
 }
 export function recentCheckins(planId: string) {
-  return (db.query('SELECT data FROM daily_checkins WHERE plan_id=? ORDER BY date DESC LIMIT 14').all(planId) as { data: string }[]).map(row => JSON.parse(row.data) as DailyCheckin)
+  return (db.prepare('SELECT data FROM daily_checkins WHERE plan_id=? ORDER BY date DESC LIMIT 14').all(planId) as { data: string }[]).map(row => JSON.parse(row.data) as DailyCheckin)
 }
 export const editableStatuses: RunStatus[] = [
   'ready',
@@ -73,7 +73,7 @@ export function editableRun(run: DailyCheckin) {
   return editableStatuses.includes(run.status) && !run.submittedAt
 }
 export function recoverInterruptedCheckins(now = Date.now()) {
-  const rows = db.query('SELECT data FROM daily_checkins WHERE status IN (\'checking\',\'submitting\')').all() as { data: string }[]
+  const rows = db.prepare('SELECT data FROM daily_checkins WHERE status IN (\'checking\',\'submitting\')').all() as { data: string }[]
   for (const row of rows) {
     const run: DailyCheckin = JSON.parse(row.data)
     run.status = run.submittedAt ? 'unknown' : 'ready'
