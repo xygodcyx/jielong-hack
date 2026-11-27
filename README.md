@@ -11,19 +11,43 @@
 
 ## 启动
 
-需要 Bun 1.3+。使用 pnpm 管理依赖，视频与音频校验另外需要 ffmpeg 中的 `ffprobe`。
+需要 **Node.js 22.13+**，使用 pnpm 管理依赖。视频与音频校验另外需要 ffmpeg 中的 `ffprobe`。
 
 ```sh
 pnpm install
 pnpm dev
 ```
 
-打开 [本地工作台](http://127.0.0.1:3210)。默认只监听本机地址。可复制 `.env.example` 为 `.env`，修改端口、监听地址等配置；Bun 会自动加载。
+打开 [本地工作台](http://127.0.0.1:3210)。默认只监听本机地址。可复制 `.env.example` 为 `.env`，修改端口、监听地址等配置；启动命令通过 Node 的 `--env-file-if-exists=.env` 自动加载。
 
 ```sh
 # macOS，按需安装视频探测工具
 brew install ffmpeg
 ```
+
+### 生产运行与 PM2
+
+生产环境先构建，PM2 按 [ecosystem.config.cjs](ecosystem.config.cjs) 直接运行编译后的 Node 程序。PM2 已列入项目开发依赖：
+
+```sh
+pnpm install --frozen-lockfile
+pnpm build
+pnpm exec pm2 start ecosystem.config.cjs
+pnpm exec pm2 save
+```
+
+不使用 PM2 时，在构建后运行 `pnpm start`。查看日志和更新代码后的重启：
+
+```sh
+pnpm exec pm2 logs jielong-studio
+# 更新代码后先重新构建，再重启
+pnpm build
+pnpm exec pm2 restart ecosystem.config.cjs --update-env
+```
+
+配置固定项目工作目录，读取同一份 `.env`，以 **单实例 fork** 运行并在异常退出后重启。收到停止或重启信号时，服务停止接收新连接和定时调度，最多等待 60 秒让在途请求与后台任务完成；PM2 的强制终止等待为 65 秒。超时中断仍按既有状态恢复规则处理，不自动重发结果不明的签到。请保持单实例，避免 `pm2 scale` 或 cluster 重复执行计划。
+
+原有 `.local/state.sqlite` 与附件目录继续使用，无须清空或迁移。首次从旧启动方式切换到 PM2 时，先停止旧进程，避免两个进程共用数据目录。若要设置开机启动，执行 `pnpm exec pm2 startup` 并按终端提示完成系统服务安装，再运行 `pnpm exec pm2 save`。完整选项见 [PM2 配置文档](https://pm2.keymetrics.io/docs/usage/application-declaration/)。
 
 ## 使用
 

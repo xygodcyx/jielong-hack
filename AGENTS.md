@@ -1,6 +1,6 @@
 # AI 接手入口
 
-本仓库是接龙工作台：Bun 服务端、原生 TypeScript 前端、SQLite 持久化。主要支持接龙、签到和周期打卡。
+本仓库是接龙工作台：Node.js 服务端、原生 TypeScript 前端、SQLite 持久化。主要支持接龙、签到和周期打卡。
 
 ## 先读什么
 
@@ -10,7 +10,8 @@
 
 ## 需要保持的产品约定
 
-- 使用 pnpm 管理依赖，Bun 运行服务、构建前端和执行测试；沿用 Antfu ESLint，不另加一套格式化配置。
+- 使用 pnpm 管理依赖，Node.js 22.13+ 运行服务，TypeScript/esbuild 构建，Vitest 执行测试；沿用 Antfu ESLint，不另加一套格式化配置。
+- PM2 使用 `ecosystem.config.cjs`，先构建再启动；保持单实例 fork，不能通过 cluster 或 scale 重复启动调度器。
 - `ThreadType` 优先支持 `0 / 5 / 90`；任务来源 `listType` 仅使用 `1 / 2 / 5`。
 - 水印相机是 `FieldType=25`，附件走 `RecordValues[].Files`。当前水印外观已获用户确认；无相关需求时保留现有 Logo、白色字标和“真实时间”镂空效果。
 - 手动添加的链接、短 ID、数字 ThreadId 归入独立分类，按真实任务 ID 去重，绑定微信账号持久保存。

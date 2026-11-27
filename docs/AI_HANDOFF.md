@@ -1,6 +1,6 @@
 # 接龙工作台：项目说明与 AI 交接文档
 
-交接日期：2026-11-24，业务时区：`Asia/Shanghai`。原始行为版本为 `fe29008`；2026-11-27 补充跨设备登录续期行为。后续修改以源码、测试和用户最新要求为准。
+交接日期：2026-11-24，业务时区：`Asia/Shanghai`。原始行为版本为 `fe29008`；2026-11-27 补充跨设备登录续期、Node.js 运行时与 PM2 部署行为。后续修改以源码、测试和用户最新要求为准。
 
 这是一个可独立运行的本地 Web 项目。阅读本文件不需要原聊天记录，也不需要取得真实账号凭证。用户使用 `jielong-hack` 作为目录名，应用名称与包名分别为“接龙工作台”和 `jielong-studio`。
 
@@ -57,18 +57,18 @@
 
 ### 2.1 技术栈与命令
 
-| 项目           | 实现                                                               |
-| -------------- | ------------------------------------------------------------------ |
-| 依赖管理       | pnpm，锁文件为 `pnpm-lock.yaml`                                    |
-| 服务端         | Bun 原生 `Bun.serve`、TypeScript、`bun:sqlite`                     |
-| 前端           | 原生 TypeScript、HTML、CSS；没有 React、Vue、Vite 或前端路由库     |
-| 打包           | `Bun.build`，入口 `src/client/app.ts`，产物 `public/assets/app.js` |
-| 媒体检测       | `sharp` 检测图片，`ffprobe` 检测视频与音频                         |
-| 邮件           | Nodemailer                                                         |
-| 格式与静态检查 | Antfu ESLint、TypeScript strict                                    |
-| 测试           | `bun test`，由 `bunfig.toml` 预加载隔离环境                        |
+| 项目           | 实现                                                                       |
+| -------------- | -------------------------------------------------------------------------- |
+| 依赖管理       | pnpm，锁文件为 `pnpm-lock.yaml`                                            |
+| 服务端         | Node.js 原生 `node:http`、TypeScript、内置 `node:sqlite`                   |
+| 前端           | 原生 TypeScript、HTML、CSS；没有 React、Vue、Vite 或前端路由库             |
+| 打包           | TypeScript 编译服务端到 `dist/`，esbuild 打包前端到 `public/assets/app.js` |
+| 媒体检测       | `sharp` 检测图片，`ffprobe` 检测视频与音频                                 |
+| 邮件           | Nodemailer                                                                 |
+| 格式与静态检查 | Antfu ESLint、TypeScript strict                                            |
+| 测试           | Vitest，由 `vitest.config.ts` 预加载 `tests/setup.ts` 隔离环境             |
 
-README 要求 Bun 1.3+；交接机器实际使用 Bun 1.4.4、Node v22.23.4、pnpm 12.18.0。它们是验证环境记录，并非已经用 `engines` 强制锁定的版本。
+当前要求 Node.js 22.13+，由 `package.json` 的 `engines` 声明；迁移验证环境为 Node v22.23.4、pnpm 12.18.0。不再需要 Bun。SQLite 使用 Node 内置 `node:sqlite`，在 Node 22 中仍有实验性提示；本次使用原有表结构和标准 SQLite 文件，没有增加数据库转换。
 
 在仓库根目录执行：
 
@@ -77,13 +77,30 @@ pnpm install
 pnpm run dev
 ```
 
-默认访问 `http://127.0.0.1:3210`。`pnpm run start` 也从 TypeScript 源码启动服务；启动时自动构建客户端。`pnpm run build` 只构建浏览器资源，不生成独立的服务端可执行文件或 `dist` 服务。
+默认访问 `http://127.0.0.1:3210`。`pnpm run dev` 使用 tsx 和 Node watch 从 TypeScript 源码启动，启动时构建前端。`pnpm run build` 编译服务端到 `dist/` 并打包浏览器资源；`pnpm run start` 与 PM2 都直接运行 `dist/server.js`，生产启动前必须构建，不在启动时依赖编译工具。
 
-`bun --watch` 用于服务重启，不提供浏览器 HMR。改动源码或样式后刷新浏览器。启动用户现有数据目录的服务会恢复已经启用的循环计划；开发预览应使用隔离目录，见第 11 节。
+`node --watch` 监听已导入的服务端模块并重启，不提供浏览器 HMR。单独修改客户端 TypeScript 后重新运行 `pnpm run dev` 或 `pnpm run build`，样式改动直接刷新浏览器。启动用户现有数据目录的服务会恢复已经启用的循环计划；开发预览应使用隔离目录，见第 11 节。
 
-### 2.2 环境变量
+### 2.2 PM2 运行
 
-Bun 启动时读取 `.env`。可按需复制 [`.env.example`](../.env.example)，不需要 SMTP 配置也能启动。配置变更后重启服务，特别是已经创建过的 SMTP transport 不会随页面刷新重建。
+仓库提供 [`ecosystem.config.cjs`](../ecosystem.config.cjs)，使用 CommonJS 配置以兼容项目的 ESM 模式。按顺序执行：
+
+```sh
+pnpm install --frozen-lockfile
+pnpm run build
+pnpm exec pm2 start ecosystem.config.cjs
+pnpm exec pm2 save
+```
+
+PM2 直接用 Node 运行 `dist/server.js`，工作目录固定为仓库根目录，`NODE_ENV=production`；端口、数据目录、邮件等由 `.env` 或外部环境提供，配置不内嵌账号凭证。更新代码后先构建，再执行 `pnpm exec pm2 restart ecosystem.config.cjs --update-env`。不使用 cluster、scale 或重叠部署，同一数据目录始终只运行一个进程。
+
+配置启用 `wait_ready`，服务监听端口并恢复状态后发送 `ready`；监听超时 10 秒。收到 SIGINT/SIGTERM 后关闭监听、停止后续定时调度，等待在途 HTTP 请求与后台任务，随后关闭数据库并退出。服务最多等待 60 秒，PM2 的 `kill_timeout` 为 65 秒；超时退出保留既有执行标记，重启继续沿用结果不明不自动重发的约定。
+
+从旧进程切换前先停掉旧启动方式，再由 PM2 启动，不能让两个进程同时恢复真实计划。开机启动用 `pnpm exec pm2 startup` 并按终端提示安装系统服务，然后重新 `pm2 save`；本仓库的变更不自动操作用户已有进程或系统服务。
+
+### 2.3 环境变量
+
+开发、生产和 PM2 启动命令均通过 Node 的 `--env-file-if-exists=.env` 读取项目 `.env`，已有进程环境变量优先。可按需复制 [`.env.example`](../.env.example)，不需要 SMTP 配置也能启动。配置变更后重启服务，特别是已经创建过的 SMTP transport 不会随页面刷新重建。
 
 | 变量               | 默认值 / 作用                                                         |
 | ------------------ | --------------------------------------------------------------------- |
@@ -94,7 +111,7 @@ Bun 启动时读取 `.env`。可按需复制 [`.env.example`](../.env.example)�
 | `FFPROBE_PATH`     | `ffprobe`，可使用可执行文件的绝对路径                                 |
 | `PUBLIC_ORIGIN`    | 可选，对外访问的完整 origin；用于写请求来源校验与 HTTPS Secure Cookie |
 | `BASE_URL`         | 邮件链接优先使用此 origin；其次 `PUBLIC_ORIGIN`，最后回退本机地址     |
-| `NODE_ENV`         | `production` 时启动构建启用压缩；不切换数据库或计划状态               |
+| `NODE_ENV`         | PM2 默认 `production`；正式构建始终压缩前端，不切换数据库或计划状态   |
 | `SMTP_HOST`        | SMTP 主机，示例为 `smtp.qq.com`；缺失则站内模式                       |
 | `SMTP_PORT`        | 默认 `465`                                                            |
 | `SMTP_SECURE`      | 未设置时由端口是否为 465 决定；显式设置时仅字符串 `true` 表示启用     |
@@ -111,7 +128,7 @@ Bun 启动时读取 `.env`。可按需复制 [`.env.example`](../.env.example)�
 
 ```mermaid
 flowchart LR
-    Browser["浏览器：表单、IndexedDB、Canvas 水印"] -->|"同源 Cookie / JSON / 文件"| Server["Bun：src/server.ts"]
+    Browser["浏览器：表单、IndexedDB、Canvas 水印"] -->|"同源 Cookie / JSON / 文件"| Server["Node.js：src/server.ts"]
     Server --> Auth["微信二维码与上游 API"]
     Server --> Store["SQLite 与本机附件"]
     Server -->|"临时签名上传，无账号 Bearer"| COS["COS 附件存储"]
@@ -130,6 +147,7 @@ flowchart LR
 | [`src/server.ts`](../src/server.ts)                             | 服务启动、静态资源白名单、会话、同源检查、全部本站路由、手动预览 Map、调度定时器 |
 | [`src/shared.ts`](../src/shared.ts)                             | `Thread / Field / RecordValue / FormSchema / Draft`、字段名称、默认值            |
 | [`src/automation-shared.ts`](../src/automation-shared.ts)       | `CheckinPlan / DailyCheckin / RunStatus` 和中文状态标签                          |
+| [`src/lib/http.ts`](../src/lib/http.ts)                         | Node HTTP 与 Web Request/Response 适配、请求体限制、文件与 Range 响应            |
 | [`src/lib/api.ts`](../src/lib/api.ts)                           | 上游请求、业务成功判定、`AppError`、查询参数构造                                 |
 | [`src/lib/auth.ts`](../src/lib/auth.ts)                         | 微信二维码与轮询、用户摘要、稳定账号 key                                         |
 | [`src/lib/thread-reference.ts`](../src/lib/thread-reference.ts) | 链接解析、分享跳转检查、短 ID 到真实 ThreadId                                    |
@@ -148,6 +166,8 @@ flowchart LR
 | [`public/index.html`](../public/index.html)                     | HTML 入口                                                                        |
 | [`public/styles.css`](../public/styles.css)                     | 界面与响应式样式                                                                 |
 | [`public/watermark-logo.webp`](../public/watermark-logo.webp)   | 已纳入项目的用户提供 Logo，不依赖下载目录                                        |
+| [`scripts/`](../scripts/)                                       | TypeScript 服务端编译、esbuild 前端构建、开发入口                                |
+| [`ecosystem.config.cjs`](../ecosystem.config.cjs)               | PM2 单实例 Node 运行、就绪通知、重启和退出等待                                   |
 | [`tests/`](../tests/)                                           | 协议、持久化、自动签到、通知与本地集成测试                                       |
 
 ### 3.2 前端状态维护
@@ -523,21 +543,25 @@ pnpm run build
 
 ### 11.2 现有测试
 
-行为版本 `fe29008` 上一次验证为 **38 项通过、0 失败、205 次断言**。2026-11-27 跨设备登录续期更新后为 **45 项通过、0 失败、268 次断言**，lint、typecheck、build 均通过；这不是对未来提交自动成立的承诺。
+行为版本 `fe29008` 上一次验证为 **38 项通过、0 失败、205 次断言**。2026-11-27 跨设备登录续期更新后为 **45 项通过、0 失败、268 次断言**，Node.js 迁移后为 **50 项通过、0 失败**；lint、typecheck、build 均通过；这不是对未来提交自动成立的承诺。
 
 | 测试文件                                                        | 覆盖范围                                                                                                |
 | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
 | [`protocol.test.ts`](../tests/protocol.test.ts)                 | listType、FeedBack/CheckIn 协议、字符串记录 ID、业务失败、字段验证、媒体限制、COS 上传凭证隔离          |
 | [`thread-reference.test.ts`](../tests/thread-reference.test.ts) | 短 ID、直接链接、类型识别、公开多级跳转、异常目标、循环与跳转上限                                       |
 | [`saved-threads.test.ts`](../tests/saved-threads.test.ts)       | 手动分类规范化去重、账号跨会话与隔离                                                                    |
+| [`media.test.ts`](../tests/media.test.ts)                       | 缺少 ffprobe、损坏图片清理、含空格的探测程序路径、视频元数据与附件账号隔离                              |
+| [`http.test.ts`](../tests/http.test.ts)                         | Node HTTP JSON/Cookie、文件/HEAD/Range、已声明及分块请求体大小限制                                      |
 | [`auth.test.ts`](../tests/auth.test.ts)                         | 设备记忆与 Token 分离、跨设备凭证同步、旧数据兼容、账号/演示隔离、扫码身份验证与迟到失效响应保护        |
 | [`automations.test.ts`](../tests/automations.test.ts)           | 北京时间、昨日内容、每日去重、版本冲突、账号/附件隔离、续期补交、截止、暂停、中断恢复、无邮箱与邮件去重 |
 | [`mail.test.ts`](../tests/mail.test.ts)                         | 模拟发送、失败退避、去重、中断 unknown、模板转义、邮箱注入拒绝                                          |
-| [`integration.test.ts`](../tests/integration.test.ts)           | 独立 Bun 服务中的演示表单、上传、确认、重复提交、CSRF、跨会话隔离、重启持久化、跨设备续期与主动退出     |
+| [`integration.test.ts`](../tests/integration.test.ts)           | 独立 Node 服务中的演示表单、上传、确认、重复提交、CSRF、跨会话隔离、重启持久化、跨设备续期与主动退出    |
+
+迁移另外完成了隔离 PM2 启动、ready、重启保留会话、停止验证，以及旧驱动创建的虚构 SQLite 文件在 Node 下的读写兼容验证；没有读取或改写真实 `.local/`。
 
 `tests/setup.ts` 在任何存储导入前设置临时 `JIELONG_DATA_DIR`。集成测试使用端口 **43210**；端口被占用时先查清占用来源，不要误杀用户进程。模拟邮件使用注入发送函数，自动签到使用可注入业务依赖，不调用真实 SMTP 或提交接口。
 
-当前集成服务会在启动时重建前端，所以测试也要求 `public/assets/` 可写。测试用临时目录不等于生产数据目录，演示模式也不应加入真实任务作为测试捷径。
+`pnpm test` 先构建再运行 Vitest，集成测试直接启动 `dist/server.js`，因此测试要求 `dist/` 与 `public/assets/` 可写。测试用临时目录不等于生产数据目录，演示模式也不应加入真实任务作为测试捷径。
 
 ### 11.3 浏览器验证方法
 
@@ -562,11 +586,11 @@ pnpm run dev
 
 ### 12.1 运行边界
 
-这是需要持续运行的 Bun 服务，不是静态站点。关掉网页仍可调度，停掉服务、电脑休眠或断网则不能按时签到；恢复后仅按当天规则处理。没有安装系统级守护进程、cron 或远程托管服务。
+这是需要持续运行的 Node.js 服务，不是静态站点。关掉网页仍可调度，停掉服务、电脑休眠或断网则不能按时签到；恢复后仅按当天规则处理。仓库提供 PM2 配置，但不会自动安装系统级守护进程、cron 或远程托管服务。
 
 当前按单实例运行设计，没有分布式 leader、任务队列服务或多进程投递承诺。开发、测试、正式运行使用不同数据目录。不要为了查看状态直接导入生产 `server.ts`，因为它会启动服务和调度器。
 
-默认只监听本机。反向代理部署需要正确设置 `PUBLIC_ORIGIN`，并按需设置对外邮件地址；代理需允许合理的上传体积和超时。服务启动需要写入前端构建目录，SQLite 与附件目录也必须可写。仓库未提供现成 Docker、systemd 或云端发布配置。
+默认只监听本机。反向代理部署需要正确设置 `PUBLIC_ORIGIN`，并按需设置对外邮件地址；代理需允许合理的上传体积和超时。构建阶段需要写入 `dist/` 和前端构建目录；生产服务只需读取构建产物，并可写 SQLite 与附件目录。仓库提供 PM2 配置，未提供现成 Docker、systemd 或云端发布配置。
 
 ### 12.2 数据备份与移动
 
@@ -574,7 +598,7 @@ pnpm run dev
 
 `media.data.path` 保存磁盘路径。移动机器或更换数据目录后，即使文件已复制，元数据仍可能指向原绝对路径；当前没有自动改写路径的迁移工具。IndexedDB 属于浏览器，尚未保存到服务端的草稿不包含在服务器数据备份内。
 
-Git 忽略 `.local/、.env、*.har、node_modules/、public/assets/`。不要为了交接上传整个工作目录，文档和源码不需要带真实数据。
+Git 忽略 `.local/、.env、*.har、node_modules/、public/assets/、dist/`。不要为了交接上传整个工作目录，文档和源码不需要带真实数据。
 
 ### 12.3 排障表
 
