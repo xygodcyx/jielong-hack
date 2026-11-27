@@ -668,7 +668,7 @@ async function login() {
   const data = await request('/api/auth/login', {})
   if (epoch !== loginEpoch)
     return
-  modal('微信扫码登录', `<div class="qr-panel"><div class="qr-frame"><img src="${esc(data.qrUrl)}?t=${Date.now()}" alt="微信登录二维码"></div><h3 id="qr-status">请使用微信扫一扫</h3><p>扫码后在微信中确认登录<br>二维码约 5 分钟内有效</p></div>`)
+  modal('微信扫码登录', `<div class="qr-panel"><div class="qr-frame"><img src="${esc(data.qrUrl)}?t=${Date.now()}" alt="微信登录二维码"></div><h3 id="qr-status">请使用微信扫一扫</h3><p>扫码后在微信中确认登录<br>二维码约 5 分钟内有效</p>${loginMailButton()}</div>`)
   while (epoch === loginEpoch) {
     const result = await request('/api/auth/poll', {})
     if (epoch !== loginEpoch)
@@ -692,6 +692,43 @@ async function login() {
       $('#qr-status').textContent = '已扫码，请在微信中确认'
     await new Promise(r => setTimeout(r, 1500))
   }
+}
+function loginMailButton() {
+  if (!me.expired || !me.mail?.remembered)
+    return ''
+  const reason = !me.mail.configured
+    ? '尚未配置 SMTP 邮件服务'
+    : !me.mail.recipients.length
+        ? '此账号尚未保存通知邮箱'
+        : ''
+  return button(`${icon('mail')} 发送登录二维码邮件`, 'login-mail', 'button', reason
+    ? `disabled title="${esc(reason)}"`
+    : '')
+}
+function testMailDialog() {
+  loginEpoch++
+  modal('发送测试邮件', `<p>发送一封测试邮件，检查邮件服务并查看当前账号信息。</p><div class="notice"><p>微信名称：${esc(me.user?.name || '微信用户')}</p><p>当前登录：${me.authenticated ? '有效' : '已过期'}</p><p>Token 到期：${esc(new Date(me.expiresAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }))}（北京时间）</p></div>${input('收件邮箱', me.mail?.recipients[0] || '', 'id="test-mail-recipient" type="email" maxlength="254" placeholder="请输入接收测试邮件的邮箱" required')}<p class="field-tip">${me.mail?.configured ? '此操作仅发送邮件，不会触发签到或修改计划。' : '尚未配置 SMTP 邮件服务，请先完成服务配置。'}</p><p id="mail-send-status" role="status" aria-live="polite"></p>`, button('关闭', 'close-modal', 'button') + button('发送测试邮件', 'send-test-mail', 'button primary', me.mail?.configured ? '' : 'disabled'))
+}
+async function showMailResult(ids: string[], node: HTMLElement) {
+  node.textContent = '已加入发送队列，正在发送…'
+  for (let attempt = 0; attempt < 20 && node.isConnected; attempt++) {
+    const query = new URLSearchParams(ids.map(id => ['id', id]))
+    const data = await request(`/api/auth/mail-status?${query}`)
+    if (!node.isConnected)
+      return
+    if (data.notices.every((notice: JsonObject) => notice.state === 'sent')) {
+      node.textContent = '邮件已发送，请检查收件箱和垃圾邮件。'
+      return
+    }
+    const failed = data.notices.find((notice: JsonObject) => notice.error || ['failed', 'unknown', 'expired'].includes(notice.state))
+    if (failed) {
+      node.textContent = failed.error || '邮件发送未完成，请检查配置。'
+      return
+    }
+    await new Promise(resolve => setTimeout(resolve, 1000))
+  }
+  if (node.isConnected)
+    node.textContent = '邮件仍在队列中，可在自动签到页查看最近邮件状态。'
 }
 async function stageOutgoing() {
   const outgoing = structuredClone(draft)
@@ -848,8 +885,11 @@ async function automationPage() {
     sent: '已发送',
     failed: '发送失败',
     unknown: '请检查收件箱',
+    expired: '二维码已过期',
   }
-  shell(`<section class="page-heading compact"><div><div class="eyebrow">DAILY ROUTINES</div><h1>自动签到<span class="title-dot">.</span></h1><p>安排循环打卡，提前编辑每一天的待签到内容。</p></div>${button(`${icon('refresh')} 刷新状态`, 'nav-automation', 'button')}</section>
+  shell(`<section class="page-heading compact"><div><div class="eyebrow">DAILY ROUTINES</div><h1>自动签到<span class="title-dot">.</span></h1><p>安排循环打卡，提前编辑每一天的待签到内容。</p></div><div class="heading-actions">${!me.demo
+    ? button(`${icon('mail')} 发送测试邮件`, 'test-mail', 'button')
+    : ''}${button(`${icon('refresh')} 刷新状态`, 'nav-automation', 'button')}</div></section>
     <div class="automatic-intro"><div>${icon('clock')}<strong>按北京时间执行</strong><p>默认 18:00，可为每个任务单独设置。每天默认复制本人昨日记录。</p></div><div>${icon('shield')}<strong>待办保存在本机</strong><p>关闭网页后继续运行；请保持本机服务运行。登录过期时等待重新扫码。</p></div><div>${icon('file')}<strong>${data.mail.configured ? '可选邮件通知' : '站内模式'}</strong><p>${data.mail.configured ? '填写邮箱可接收结果和续期提醒，也可以留空。' : '无需配置邮箱，结果、待办与登录状态都在这里查看。'}</p></div></div>
     ${me.demo ? '<div class="notice demo-notice">演示计划只在本机模拟执行，不会发送真实签到或邮件。</div>' : ''}
     <section class="automatic-list">${data.plans.length
@@ -875,6 +915,8 @@ async function automationPage() {
           ? button('查看今日内容', 'auto-open', 'text-button', `data-id="${esc(plan.id)}" data-date="${beijingDay()}"`)
           : ''}${plan.enabled
           ? button('暂停循环签到', 'auto-pause', 'text-button', `data-id="${esc(plan.id)}"`)
+          : ''}${plan.emailEnabled
+          ? button(`${icon('mail')} 发送通知邮件`, 'auto-notify', 'text-button', `data-id="${esc(plan.id)}"`)
           : ''}</div>
         ${plan.recent.length
           ? `<details class="automatic-records"><summary>最近签到记录</summary>${plan.recent.slice(0, 7).map((run: DailyCheckin) => `<div><time>${esc(run.date)}</time><span>${esc(runLabels[run.status])}</span><p>${esc(run.message)}</p></div>`).join('')}</details>`
@@ -988,6 +1030,48 @@ async function confirmAutomatic(el: HTMLButtonElement) {
   }
 }
 async function action(name: string, el: HTMLElement) {
+  if (name === 'test-mail') {
+    testMailDialog()
+    return
+  }
+  if (name === 'send-test-mail') {
+    const recipient = $<HTMLInputElement>('#test-mail-recipient')
+    if (!recipient.reportValidity())
+      return
+    const buttonEl = el as HTMLButtonElement
+    const node = $('#mail-send-status')
+    buttonEl.disabled = true
+    try {
+      const result = await request('/api/notifications/test', { recipient: recipient.value })
+      await showMailResult(result.ids, node)
+    }
+    catch (error) {
+      node.textContent = (error as Error).message
+    }
+    finally {
+      buttonEl.disabled = false
+    }
+    return
+  }
+  if (name === 'login-mail' || name === 'auto-notify') {
+    closeModal()
+    modal(name === 'login-mail'
+      ? '发送登录二维码邮件'
+      : '发送签到通知', `<p>${name === 'login-mail'
+      ? `发送至此账号已保存的通知邮箱：${esc(me.mail.recipients.join('、'))}。二维码约 5 分钟有效，请使用原微信账号扫码。`
+      : '发送当前计划与今日签到状态到已保存的通知邮箱。'}</p><p id="mail-send-status" role="status" aria-live="polite">正在准备邮件…</p>`, button('关闭', 'close-modal', 'button'))
+    const node = $('#mail-send-status')
+    try {
+      const result = await request(name === 'login-mail'
+        ? '/api/auth/login-mail'
+        : `/api/automations/${el.dataset.id}/notify`, {})
+      await showMailResult(result.ids, node)
+    }
+    catch (error) {
+      node.textContent = (error as Error).message
+    }
+    return
+  }
   if (name === 'nav-automation') {
     await automationPage()
     return
@@ -1400,7 +1484,11 @@ document.addEventListener('submit', (e) => {
   e.preventDefault()
 })
 function authBanner() {
-  return `<div id="auth-banner" class="notice auth-banner">登录已失效，等待同账号其他设备续期，也可在此扫码恢复。${button('微信扫码恢复', 'login', 'button')}</div>`
+  return `<div id="auth-banner" class="notice auth-banner"><span>登录已失效，等待同账号其他设备续期，也可在此扫码恢复。${me.mail?.remembered && (!me.mail.configured || !me.mail.recipients.length)
+    ? `<small class="field-tip">${!me.mail.configured
+      ? '发送登录邮件需先配置 SMTP。'
+      : '此账号尚未保存通知邮箱，请先扫码并设置。'}</small>`
+    : ''}</span><div class="heading-actions">${button('微信扫码恢复', 'login', 'button')}${loginMailButton()}</div></div>`
 }
 let checkingRememberedLogin = false
 async function refreshRememberedLogin() {
@@ -1410,9 +1498,14 @@ async function refreshRememberedLogin() {
   const previous = me
   try {
     const current = await request('/api/auth/me')
-    if (me !== previous || !current.authenticated || current.scope !== previous.scope)
+    if (me !== previous || current.scope !== previous.scope)
       return
     me = current
+    if (!current.authenticated) {
+      if ($('#auth-banner'))
+        $('#auth-banner').outerHTML = authBanner()
+      return
+    }
     $('#auth-banner')?.remove()
     $('.profile').innerHTML = profileContent()
     $('.topbar-end').firstElementChild!.outerHTML = connectionStatus()

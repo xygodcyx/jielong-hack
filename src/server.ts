@@ -5,6 +5,7 @@ import { createServer } from 'node:http'
 import { join } from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
+import { accountMailInfo, LoginMailService, queueTestMail } from './lib/account-mail.ts'
 import { api, AppError } from './lib/api.ts'
 import { authenticated, invalidateSessionAuth, manualThreadOwner, pollLogin, startLogin, syncSessionAuth } from './lib/auth.ts'
 import { getPlan, recoverInterruptedCheckins } from './lib/automation-store.ts'
@@ -12,7 +13,7 @@ import { automationMediaOwner, automations } from './lib/automations.ts'
 import { demoSchema, demoThreads } from './lib/demo.ts'
 import { createPayload, listThreads, loadSchema, records, validateDraft } from './lib/forms.ts'
 import { fileResponse, handleNodeRequest } from './lib/http.ts'
-import { flushNotices, mailHistory, mailSettings, recoverInterruptedMail } from './lib/mail.ts'
+import { flushNotices, mailHistory, mailSettings, mailStatus, recoverInterruptedMail } from './lib/mail.ts'
 import { resolveFiles, stageMedia } from './lib/media.ts'
 import { addHistory, db, deleteSession, getMedia, getSession, history, manualThreads, saveManualThread, saveSession, sessionMaxAge } from './lib/store.ts'
 import { parseThreadReference, resolveThreadId } from './lib/thread-reference.ts'
@@ -26,6 +27,10 @@ function runBackground(work: () => Promise<unknown>, message: string) {
   const task = work().catch(() => console.warn(message)).finally(() => backgroundJobs.delete(task))
   backgroundJobs.add(task)
 }
+const loginMail = new LoginMailService(async (owner, session) => {
+  await automations.registerLogin(owner, session)
+  runBackground(() => automations.tick(), '自动签到检查未完成，下次检查将继续。')
+})
 const prepared = new Map<string, {
   owner: string
   schema: FormSchema
@@ -77,6 +82,7 @@ async function routes(req: Request, url: URL, s: Session): Promise<Response> {
       user: s.user || null,
       expiresAt: s.token ? s.expire : null,
       scope: hash(s.id).slice(0, 20),
+      mail: accountMailInfo(s),
     })
   }
   if (path === '/api/auth/demo' && req.method === 'POST') {
@@ -89,6 +95,21 @@ async function routes(req: Request, url: URL, s: Session): Promise<Response> {
   }
   if (path === '/api/auth/login' && req.method === 'POST')
     return json(await startLogin(s))
+  if (path === '/api/auth/login-mail' && req.method === 'POST') {
+    const result = await loginMail.send(s)
+    runBackground(() => flushNotices(), '邮件通知检查未完成。')
+    return json(result)
+  }
+  if (path === '/api/auth/mail-status' && req.method === 'GET') {
+    if (!accountMailInfo(s).remembered)
+      throw new AppError('本地没有此微信账号的登录信息。', 403)
+    const ids = url.searchParams.getAll('id')
+    if (!ids.length || ids.length > 50)
+      throw new AppError('邮件通知参数无效。')
+    return json({
+      notices: ids.map(id => mailStatus(s.accountKey!, id)),
+    })
+  }
   if (path === '/api/auth/poll' && req.method === 'POST') {
     const wasSuccessful = s.login?.status === 'success'
     const result = await pollLogin(s)
@@ -119,6 +140,14 @@ async function routes(req: Request, url: URL, s: Session): Promise<Response> {
     return json({ ok: true })
   }
   requireAuth(s)
+  if (path === '/api/notifications/test' && req.method === 'POST') {
+    const body = await req.json()
+    const id = queueTestMail(s, body.recipient)
+    runBackground(() => flushNotices(), '邮件通知检查未完成。')
+    return json({
+      ids: [id],
+    })
+  }
   if (path === '/api/automations' && req.method === 'GET') {
     const owner = await manualThreadOwner(s)
     return json({
@@ -138,10 +167,17 @@ async function routes(req: Request, url: URL, s: Session): Promise<Response> {
       ...await automations.editableDaily(plan),
     })
   }
-  const automationMatch = path.match(/^\/api\/automations\/([a-f\d-]{36})\/(draft|save|toggle|refresh)$/)
+  const automationMatch = path.match(/^\/api\/automations\/([a-f\d-]{36})\/(draft|save|toggle|refresh|notify)$/)
   if (automationMatch) {
     const owner = await manualThreadOwner(s)
     const plan = getPlan(automationMatch[1], owner)
+    if (automationMatch[2] === 'notify' && req.method === 'POST') {
+      const id = automations.notify(owner, plan.id)
+      runBackground(() => flushNotices(), '邮件通知检查未完成。')
+      return json({
+        ids: [id],
+      })
+    }
     if (automationMatch[2] === 'draft' && req.method === 'GET') {
       const { owner: _, schema: __, privacyHash: ___, ...publicPlan } = plan
       return json({
@@ -456,12 +492,17 @@ async function start() {
   }
   const firstTick = setTimeout(tick, 1500)
   const interval = setInterval(tick, 30000)
+  const loginMailInterval = setInterval(() => {
+    runBackground(() => loginMail.tick(), '邮件扫码状态检查未完成。')
+  }, 5000)
+  runBackground(() => loginMail.tick(), '邮件扫码状态检查未完成。')
   const shutdown = async () => {
     if (stopping)
       return
     stopping = true
     clearTimeout(firstTick)
     clearInterval(interval)
+    clearInterval(loginMailInterval)
     const deadline = setTimeout(() => {
       console.warn('退出等待超过 60 秒，保留执行状态，下次启动时核对。')
       server.closeAllConnections()

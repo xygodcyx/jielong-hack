@@ -65,7 +65,7 @@ export async function pollLogin(s: Session, fetcher: typeof fetch = fetch) {
     saveSession(s)
     return { status: 'expired' }
   }
-  if (s.login.status === 'success' || inflight.has(s.id))
+  if (['success', 'expired'].includes(s.login.status) || inflight.has(s.id))
     return { status: s.login.status }
   inflight.add(s.id)
   try {
@@ -95,6 +95,11 @@ export async function pollLogin(s: Session, fetcher: typeof fetch = fetch) {
       const current = await api('/api/User/CurrentUser', token, undefined, fetcher)
       const key = accountKey(current.Data)
       requireCurrentLogin(s)
+      if (s.login.expectedAccountKey && key !== s.login.expectedAccountKey) {
+        s.login.status = 'expired'
+        saveSession(s)
+        throw new AppError('请使用发送邮件时绑定的原微信账号扫码。', 403)
+      }
       s.token = token
       s.expire = expire
       s.user = publicUser(current.Data)

@@ -2,6 +2,7 @@ import type { CheckinPlan, DailyCheckin } from '../automation-shared.ts'
 import type { Draft, FormSchema, JsonObject } from '../shared.ts'
 import type { Session } from './store.ts'
 import { createHash } from 'node:crypto'
+import { runLabels } from '../automation-shared.ts'
 import { blankValue } from '../shared.ts'
 import { api, AppError } from './api.ts'
 import { automationAccount, dailyCheckin, editableRun, getPlan, insertDailyCheckin, invalidateAutomationAccount, plans, recentCheckins, saveAutomationAccount, savePlan, updateDailyCheckin } from './automation-store.ts'
@@ -9,7 +10,7 @@ import { beijingDate, closingAt, offsetDate, scheduledAt, validTime } from './ch
 import { ownCheckin } from './checkin-records.ts'
 import { demoSchema } from './demo.ts'
 import { createPayload, loadSchema, validateDraft } from './forms.ts'
-import { mailSettings, queueNotice, siteUrl, validEmail } from './mail.ts'
+import { mailSettings, queueManualNotice, queueNotice, siteUrl, validEmail } from './mail.ts'
 import { resolveFiles, validateMedia } from './media.ts'
 import { addHistory, getMedia, saveMedia } from './store.ts'
 
@@ -326,6 +327,31 @@ export class AutomationService {
       loginExpired: !plan.demo && (automationAccount(owner)?.expire || 0) <= this.dependencies.now(),
       emailEnabled: !plan.demo && !!plan.recipient && mailSettings().configured,
     }))
+  }
+
+  notify(owner: string, planId: string) {
+    const plan = getPlan(planId, owner)
+    if (plan.demo)
+      throw new AppError('演示计划不发送真实邮件。')
+    const recipient = validEmail(plan.recipient)
+    const now = this.dependencies.now()
+    const date = beijingDate(now)
+    const run = dailyCheckin(plan.id, date)
+    return queueManualNotice(`status:${plan.id}`, owner, recipient, {
+      subject: `【接龙工作台】签到状态 · ${plan.thread.title}`,
+      title: '手动签到状态通知',
+      lines: [
+        plan.thread.title,
+        `签到日期：${date}（北京时间）`,
+        `循环计划：${plan.enabled ? '已启用' : '已暂停'}；每日 ${plan.time}（北京时间）。`,
+        `今日状态：${run ? runLabels[run.status] : '等待生成待办'}。${run?.message || ''}`,
+        (automationAccount(owner)?.expire || 0) <= now
+          ? '微信登录已过期，请使用原微信账号重新扫码。'
+          : '微信登录有效。',
+      ],
+      actionUrl: `${siteUrl()}/?automation=1`,
+      actionLabel: '查看签到与待办',
+    }, now)
   }
 
   private finish(plan: CheckinPlan, run: DailyCheckin, status: DailyCheckin['status'], message: string) {

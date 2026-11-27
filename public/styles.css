@@ -2911,10 +2911,17 @@ select {
 }
 .auth-banner {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: center;
   margin: 20px 32px 0;
   gap: 18px;
+}
+.auth-banner .heading-actions {
+  flex-wrap: wrap;
+}
+.auth-banner .field-tip {
+  display: block;
 }
 @media (max-width: 700px) {
   .editor-heading .heading-actions {

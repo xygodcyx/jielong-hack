@@ -2,20 +2,43 @@ import type { AutomationDependencies } from '../src/lib/automations.ts'
 import type { Session } from '../src/lib/store.ts'
 import type { JsonObject } from '../src/shared.ts'
 import process from 'node:process'
-import { afterEach, expect, it } from 'vitest'
+import { afterEach, expect, it, vi } from 'vitest'
 import { AppError } from '../src/lib/api.ts'
 import { automationAccount, dailyCheckin, getPlan, plans, recoverInterruptedCheckins, saveAutomationAccount, savePlan, updateDailyCheckin } from '../src/lib/automation-store.ts'
 import { automationMediaOwner, AutomationService } from '../src/lib/automations.ts'
 import { beijingDate, closingAt, offsetDate, recordDate, scheduledAt, validTime } from '../src/lib/checkin-calendar.ts'
 import { demoSchema } from '../src/lib/demo.ts'
-import { mailHistory } from '../src/lib/mail.ts'
+import { flushNotices, mailHistory } from '../src/lib/mail.ts'
 import { db, getMedia, saveMedia } from '../src/lib/store.ts'
 
 const stamp = (time: string) => Date.parse(`2026-11-24T${time}:00+08:00`)
 afterEach(() => {
+  vi.unstubAllEnvs()
   for (const plan of plans())
     savePlan({ ...plan, enabled: false })
   db.prepare('DELETE FROM mail_outbox WHERE owner LIKE \'test-automation:%\'').run()
+})
+
+it('手动发送当前签到状态，使用计划邮箱、隔离账号且不触发签到', async () => {
+  vi.stubEnv('SMTP_HOST', 'fixture.invalid')
+  vi.stubEnv('SMTP_USER', 'sender@example.com')
+  vi.stubEnv('SMTP_PASS', 'fixture-password')
+  const f = await fixture()
+  savePlan({ ...f.plan, recipient: 'status@example.com' })
+  const before = dailyCheckin(f.plan.id, f.run.date)
+  expect(() => f.service.notify('other-account', f.plan.id)).toThrow('不存在')
+  f.service.notify(f.owner, f.plan.id)
+  expect(() => f.service.notify(f.owner, f.plan.id)).toThrow('一分钟')
+  let body = ''
+  await flushNotices(stamp('17:00'), async (recipient, notice) => {
+    expect(recipient).toBe('status@example.com')
+    body = notice.lines.join('\n')
+  })
+  expect(body).toContain('待签到')
+  expect(body).toContain('2026-11-24')
+  expect(f.submissions()).toBe(0)
+  expect(dailyCheckin(f.plan.id, f.run.date)).toEqual(before)
+  expect(mailHistory(f.owner)[0]?.state).toBe('sent')
 })
 async function fixture(overrides: Partial<AutomationDependencies> = {}) {
   let now = stamp('17:00')

@@ -1,5 +1,8 @@
-import { expect, it } from 'vitest'
-import { flushNotices, mailHistory, queueNotice, recoverInterruptedMail, renderNotice, validEmail } from '../src/lib/mail.ts'
+import type { Transporter } from 'nodemailer'
+import { Buffer } from 'node:buffer'
+import nodemailer from 'nodemailer'
+import { expect, it, vi } from 'vitest'
+import { flushNotices, mailHistory, queueNotice, recoverInterruptedMail, renderNotice, sendNotice, validEmail } from '../src/lib/mail.ts'
 import { db } from '../src/lib/store.ts'
 
 it('邮件通知去重、持久化与失败退避，不实际发送邮件', async () => {
@@ -52,4 +55,56 @@ it('重启不重复发送结果不明的邮件；模板转义正文，拒绝邮�
   expect(rendered.html).toContain('&lt;script&gt;')
   expect(rendered.html).toContain('a &amp; b')
   expect(() => validEmail('test@example.com\r\nBCC:a@b.com')).toThrow()
+})
+
+it('登录二维码作为内嵌 PNG 附件交给邮件服务，不使用远程图片或本机文件路径', async () => {
+  vi.stubEnv('SMTP_HOST', 'fixture.invalid')
+  vi.stubEnv('SMTP_USER', 'sender@example.com')
+  vi.stubEnv('SMTP_PASS', 'fixture-password')
+  const sendMail = vi.fn(async (_message: unknown) => ({}))
+  const create = vi.spyOn(nodemailer, 'createTransport').mockReturnValue({ sendMail } as unknown as Transporter)
+  try {
+    await sendNotice('test@example.com', {
+      subject: '二维码',
+      title: '登录',
+      lines: ['扫码'],
+      qrImage: Buffer.from('fixture-image').toString('base64'),
+    })
+    const message = sendMail.mock.calls[0]![0] as any
+    expect(message.to).toBe('test@example.com')
+    expect(message.html).toContain('cid:wechat-login-qr')
+    expect(message.attachments).toHaveLength(1)
+    expect(message.attachments[0].content.toString()).toBe('fixture-image')
+    expect(message.attachments[0].contentType).toBe('image/png')
+    expect(message.attachments[0].path).toBeUndefined()
+    expect(message.attachments[0].cid).toBe('wechat-login-qr')
+  }
+  finally {
+    create.mockRestore()
+    vi.unstubAllEnvs()
+  }
+})
+
+it('队列中前一封邮件阻塞至二维码过期时，不再发送后续过期二维码', async () => {
+  vi.useFakeTimers()
+  try {
+    const now = Date.now()
+    const owner = crypto.randomUUID()
+    queueNotice(`${owner}:first`, owner, 'test@example.com', { subject: '先发', title: '先发', lines: [] }, now)
+    queueNotice(`${owner}:qr`, owner, 'test@example.com', {
+      subject: '二维码',
+      title: '登录',
+      lines: [],
+      expiresAt: now + 300000,
+    }, now + 1)
+    const send = vi.fn(async () => {
+      vi.setSystemTime(now + 600000)
+    })
+    await flushNotices(now + 1, send)
+    expect(send).toHaveBeenCalledTimes(1)
+    expect(mailHistory(owner).find(notice => notice.id.endsWith(':qr'))?.state).toBe('expired')
+  }
+  finally {
+    vi.useRealTimers()
+  }
 })
