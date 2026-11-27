@@ -109,9 +109,7 @@ function releaseUrls() {
 function profileContent() {
   return `<span class="avatar">${esc(me.user?.name?.slice(0, 1) || '未')}</span><div><strong>${esc(me.user?.name || '尚未登录')}</strong><small>${me.demo
     ? '演示空间'
-    : me.authenticated ? '微信已连接' : '连接你的微信账号'}</small></div>${me.authenticated || me.expired
-    ? button(icon('logout'), 'logout', 'icon-button', 'aria-label="退出登录"')
-    : ''}`
+    : me.authenticated ? '微信已连接' : '连接你的微信账号'}</small></div>`
 }
 function connectionStatus() {
   return me.demo
@@ -147,7 +145,9 @@ function shell(content: string) {
       month: 'long',
       day: 'numeric',
       weekday: 'short',
-    }).format(new Date())}</span></div></header>
+    }).format(new Date())}</span>${me.authenticated || me.expired
+      ? button(`${icon('logout')} ${me.demo ? '退出演示' : '退出登录'}`, 'logout', 'button logout-button', 'title="退出当前网页登录；已启用的自动签到继续运行"')
+      : ''}</div></header>
     ${me.expired
       ? authBanner()
       : ''}<main id="main" tabindex="-1">${content}</main><footer class="app-footer"><span>接龙工作台 · 让每一份记录井井有条</span><span>LOCAL WORKSPACE</span></footer></div>`
@@ -1074,14 +1074,18 @@ async function action(name: string, el: HTMLElement) {
     return
   }
   if (name === 'logout') {
-    await saveCurrent()
-    await request('/api/auth/logout', {})
-    releaseUrls()
-    schema = null
-    scheduled = null
-    me = await request('/api/auth/me')
-    view = 'tasks'
-    welcome()
+    const buttonEl = el as HTMLButtonElement
+    buttonEl.disabled = true
+    clearTimeout(saveTimer)
+    try {
+      await saveCurrent()
+      await request('/api/auth/logout', {})
+      location.replace('/')
+    }
+    catch (error) {
+      buttonEl.disabled = false
+      throw error
+    }
     return
   }
   if (name === 'refresh') {
