@@ -1,4 +1,5 @@
 import process from 'node:process'
+import { Database } from 'bun:sqlite'
 import { afterAll, beforeAll, expect, it } from 'bun:test'
 import sharp from 'sharp'
 
@@ -27,12 +28,27 @@ async function call(path: string, body?: unknown, session = cookie) {
   })
   if (response.headers.get('set-cookie'))
     cookie = response.headers.get('set-cookie')!.split(';')[0]
-  return { status: response.status, data: await response.json() }
+  return {
+    status: response.status,
+    data: await response.json(),
+    setCookie: response.headers.get('set-cookie'),
+  }
 }
 async function startServer() {
   child = Bun.spawn(['bun', 'src/server.ts'], {
     cwd: `${import.meta.dir}/..`,
-    env: { ...process.env, PORT: '43210', JIELONG_DATA_DIR: `${process.env.JIELONG_DATA_DIR}/integration` },
+    env: {
+      ...process.env,
+      HOST: '127.0.0.1',
+      PORT: '43210',
+      PUBLIC_ORIGIN: origin,
+      BASE_URL: origin,
+      SMTP_HOST: '',
+      SMTP_USER: '',
+      SMTP_PASS: '',
+      TO_EMAIL: '',
+      JIELONG_DATA_DIR: `${process.env.JIELONG_DATA_DIR}/integration`,
+    },
     stdout: 'ignore',
     stderr: 'pipe',
   })
@@ -172,4 +188,66 @@ it('自动签到计划默认暂停、无需邮箱，待办重启保留且隔离�
   await call('/api/auth/demo', {})
   expect((await call(`/api/automations/${id}/draft`)).status).toBe(404)
   cookie = ownCookie
+}, 10000)
+
+it('两地登录共享最新凭证，过期设备保留身份，重启可恢复且主动退出只撤销当前设备', async () => {
+  const ownCookie = cookie
+  const database = new Database(`${process.env.JIELONG_DATA_DIR}/integration/state.sqlite`)
+  const owner = 'wechat:fixture-shared-login'
+  const first = {
+    id: crypto.randomUUID(),
+    accountKey: owner,
+    token: 'Bearer fixture-first-expired',
+    expire: Date.now() - 1000,
+    user: { name: '过期设备' },
+  }
+  const second = {
+    ...first,
+    id: crypto.randomUUID(),
+    token: 'Bearer fixture-second-renewed',
+    expire: Date.now() + 3600000,
+    user: { name: '同一微信' },
+    login: { status: 'success', expiresAt: Date.now() + 60000 },
+  }
+  const firstCookie = `jielong_session=${first.id}`
+  const secondCookie = `jielong_session=${second.id}`
+  try {
+    for (const s of [first, second])
+      database.query('INSERT INTO sessions VALUES (?,?,?)').run(s.id, JSON.stringify(s), s.expire)
+    database.query('INSERT INTO automation_accounts VALUES (?,?)').run(owner, JSON.stringify(first))
+    const expired = await call('/api/auth/me', undefined, firstCookie)
+    expect(expired.data.authenticated).toBe(false)
+    expect(expired.data.expired).toBe(true)
+    expect(cookie).toBe(firstCookie)
+    expect((await call('/api/manual-threads', undefined, firstCookie)).status).toBe(401)
+
+    database.query('UPDATE automation_accounts SET data=? WHERE owner=?').run(JSON.stringify(second), owner)
+    const restored = await call('/api/auth/me', undefined, firstCookie)
+    expect(restored.data.authenticated).toBe(true)
+    expect(restored.data.expired).toBe(false)
+    expect(restored.data.scope).toBe(expired.data.scope)
+    expect(restored.data.user.name).toBe('同一微信')
+    expect(restored.data.expiresAt).toBe(second.expire)
+    expect(restored.setCookie).toContain('Max-Age=31536000')
+    expect(JSON.stringify(restored.data)).not.toContain(second.token)
+    expect((await call('/api/manual-threads', undefined, firstCookie)).status).toBe(200)
+    const persisted = database.query('SELECT data FROM sessions WHERE id=?').get(first.id) as { data: string }
+    expect(JSON.parse(persisted.data).token).toBe(second.token)
+    expect((await call('/api/auth/poll', {}, secondCookie)).data.status).toBe('success')
+
+    child.kill()
+    await child.exited
+    await startServer()
+    expect((await call('/api/auth/me', undefined, firstCookie)).data.authenticated).toBe(true)
+    const logout = await call('/api/auth/logout', {}, firstCookie)
+    expect(logout.setCookie).toContain('Max-Age=0')
+    expect((await call('/api/auth/me', undefined, firstCookie)).data.authenticated).toBe(false)
+    expect(cookie).not.toBe(firstCookie)
+    expect((await call('/api/auth/me', undefined, secondCookie)).data.authenticated).toBe(true)
+    expect((await call(`/api/auth/me?accountKey=${owner}`, undefined, '')).data.authenticated).toBe(false)
+  }
+  finally {
+    database.close()
+    cookie = ownCookie
+  }
 }, 10000)

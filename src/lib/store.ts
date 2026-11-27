@@ -22,7 +22,10 @@ export interface Session extends JsonObject {
   user?: JsonObject
   login?: JsonObject
   accountKey?: string
+  sessionExpiresAt?: number
 }
+
+export const sessionMaxAge = 365 * 86400
 
 export function saveManualThread(owner: string, thread: Thread) {
   const now = Date.now()
@@ -43,13 +46,23 @@ export function manualThreads(owner: string, pageIndex = 1, pageSize = 50) {
   }
 }
 export function saveSession(s: Session) {
-  db.query('INSERT OR REPLACE INTO sessions VALUES (?,?,?)').run(s.id, JSON.stringify(s), s.expire)
+  s.sessionExpiresAt ??= Date.now() + sessionMaxAge * 1000
+  db.query('INSERT OR REPLACE INTO sessions VALUES (?,?,?)').run(s.id, JSON.stringify(s), s.sessionExpiresAt)
 }
 export function getSession(id: string): Session | null {
-  const r = db.query('SELECT data, expires FROM sessions WHERE id=?').get(id) as any
-  return r && r.expires > Date.now()
-    ? JSON.parse(r.data)
-    : null
+  const row = db.query('SELECT data, expires FROM sessions WHERE id=?').get(id) as { data: string, expires: number } | null
+  if (!row)
+    return null
+  const session: Session = JSON.parse(row.data)
+  // 旧版把 Token 过期时间当作会话期限；保留已验证的账号绑定。
+  const expires = session.sessionExpiresAt ?? (session.accountKey && !session.demo
+    ? Date.now() + sessionMaxAge * 1000
+    : row.expires)
+  if (expires <= Date.now())
+    return null
+  session.sessionExpiresAt = Date.now() + sessionMaxAge * 1000
+  saveSession(session)
+  return session
 }
 export function deleteSession(id: string) {
   db.query('DELETE FROM sessions WHERE id=?').run(id)

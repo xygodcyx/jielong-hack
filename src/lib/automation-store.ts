@@ -15,7 +15,8 @@ export function automationAccount(owner: string): Session | null {
 }
 export function saveAutomationAccount(owner: string, session: Session, force = false) {
   const old = automationAccount(owner)
-  if (!force && old && (old.expire > session.expire || (old.expire === 0 && old.token === session.token)))
+  // 普通待办保存不能用请求开始时的旧快照覆盖其他设备刚扫码的凭证。
+  if (!force && old)
     return
   const { login: _, ...safe } = session
   db.query('INSERT OR REPLACE INTO automation_accounts VALUES (?,?)').run(owner, JSON.stringify(safe))

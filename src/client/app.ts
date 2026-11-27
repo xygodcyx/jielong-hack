@@ -106,6 +106,18 @@ function releaseUrls() {
     URL.revokeObjectURL(lastPreviewUrl)
   lastPreviewUrl = ''
 }
+function profileContent() {
+  return `<span class="avatar">${esc(me.user?.name?.slice(0, 1) || '未')}</span><div><strong>${esc(me.user?.name || '尚未登录')}</strong><small>${me.demo
+    ? '演示空间'
+    : me.authenticated ? '微信已连接' : '连接你的微信账号'}</small></div>${me.authenticated || me.expired
+    ? button(icon('logout'), 'logout', 'icon-button', 'aria-label="退出登录"')
+    : ''}`
+}
+function connectionStatus() {
+  return me.demo
+    ? '<span class="badge demo-badge">演示模式</span>'
+    : me.authenticated ? '<span class="connected"><i></i> 微信已连接</span>' : '<span class="muted">本地工作台</span>'
+}
 function shell(content: string) {
   app.innerHTML = `<aside class="sidebar"><a class="brand" href="/" aria-label="接龙工作台首页"><span class="brand-symbol">${icon('layers')}</span><span>接龙工作台<small>JIELONG STUDIO</small></span></a>
     <div class="workspace-label">个人工作空间</div><nav aria-label="主导航">
@@ -121,11 +133,7 @@ function shell(content: string) {
       ? 'active'
       : ''}`)).join('')}</nav>
     <div class="sidebar-bottom"><div class="local-note">${icon('shield')}<span>本机保存登录状态<small>手动确认或按计划执行</small></span></div>${button(`${icon('help')} 使用说明`, 'help', 'nav-item')}
-    <div class="profile"><span class="avatar">${esc(me.user?.name?.slice(0, 1) || '未')}</span><div><strong>${esc(me.user?.name || '尚未登录')}</strong><small>${me.demo
-      ? '演示空间'
-      : me.authenticated ? '微信已连接' : '连接你的微信账号'}</small></div>${me.authenticated
-      ? button(icon('logout'), 'logout', 'icon-button', 'aria-label="退出登录"')
-      : ''}</div></div></aside>
+    <div class="profile">${profileContent()}</div></div></aside>
     <div class="main-shell"><header class="topbar"><div class="breadcrumb">个人空间 <span>/</span> ${view === 'studio'
       ? '水印工作室'
       : view === 'manual'
@@ -134,16 +142,14 @@ function shell(content: string) {
           ? scheduled ? '自动签到 / 编辑待办' : '自动签到'
           : view === 'history'
             ? '提交记录'
-            : schema ? '编辑任务' : '我的任务'}</div><div class="topbar-end">${me.demo
-      ? '<span class="badge demo-badge">演示模式</span>'
-      : me.authenticated ? '<span class="connected"><i></i> 微信已连接</span>' : '<span class="muted">本地工作台</span>'}<span class="top-date">${new Intl.DateTimeFormat('zh-CN', {
+            : schema ? '编辑任务' : '我的任务'}</div><div class="topbar-end">${connectionStatus()}<span class="top-date">${new Intl.DateTimeFormat('zh-CN', {
       timeZone: 'Asia/Shanghai',
       month: 'long',
       day: 'numeric',
       weekday: 'short',
     }).format(new Date())}</span></div></header>
     ${me.expired
-      ? `<div id="auth-banner" class="notice auth-banner">登录已失效，循环签到等待重新登录。${button('微信扫码恢复', 'login', 'button')}</div>`
+      ? authBanner()
       : ''}<main id="main" tabindex="-1">${content}</main><footer class="app-footer"><span>接龙工作台 · 让每一份记录井井有条</span><span>LOCAL WORKSPACE</span></footer></div>`
 }
 function welcome() {
@@ -1389,15 +1395,54 @@ document.addEventListener('keydown', (e) => {
 document.addEventListener('submit', (e) => {
   e.preventDefault()
 })
+function authBanner() {
+  return `<div id="auth-banner" class="notice auth-banner">登录已失效，等待同账号其他设备续期，也可在此扫码恢复。${button('微信扫码恢复', 'login', 'button')}</div>`
+}
+let checkingRememberedLogin = false
+async function refreshRememberedLogin() {
+  if (!me.expired || checkingRememberedLogin || document.visibilityState !== 'visible' || modalRoot.firstElementChild)
+    return
+  checkingRememberedLogin = true
+  const previous = me
+  try {
+    const current = await request('/api/auth/me')
+    if (me !== previous || !current.authenticated || current.scope !== previous.scope)
+      return
+    me = current
+    $('#auth-banner')?.remove()
+    $('.profile').innerHTML = profileContent()
+    $('.topbar-end').firstElementChild!.outerHTML = connectionStatus()
+    toast('已同步此微信账号的最新登录状态')
+    if (!schema && view !== 'studio') {
+      if (view === 'automation' || automationReturn)
+        await automationPage()
+      else if (view === 'history')
+        await historyPage()
+      else
+        await loadTasks()
+    }
+  }
+  finally {
+    checkingRememberedLogin = false
+  }
+}
 document.addEventListener('auth-expired', () => {
   if (me.expired)
     return
   me.expired = true
   me.authenticated = false
   automationReturn = view === 'automation'
-  toast('登录已失效，请重新扫码。', true)
+  toast('登录已失效，其他设备续期后会自动恢复，也可重新扫码。', true)
   if (!$('#auth-banner'))
-    $('.topbar')?.insertAdjacentHTML('afterend', `<div id="auth-banner" class="notice auth-banner">登录已失效，循环签到等待重新登录。${button('微信扫码恢复', 'login', 'button')}</div>`)
+    $('.topbar')?.insertAdjacentHTML('afterend', authBanner())
+  $('.profile').innerHTML = profileContent()
+  void refreshRememberedLogin().catch(() => { })
+})
+window.addEventListener('focus', () => {
+  void refreshRememberedLogin().catch(() => { })
+})
+document.addEventListener('visibilitychange', () => {
+  void refreshRememberedLogin().catch(() => { })
 })
 window.addEventListener('pagehide', () => {
   void saveCurrent()
@@ -1419,6 +1464,7 @@ void init().catch((e) => {
   toast(e.message, true)
 })
 setInterval(() => {
+  void refreshRememberedLogin().catch(() => { })
   if (view === 'automation' && !schema && me.authenticated && !me.expired && !modalRoot.firstElementChild && document.visibilityState === 'visible')
     void automationPage().catch(() => { })
 }, 30000)

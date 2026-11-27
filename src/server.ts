@@ -4,14 +4,14 @@ import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import process from 'node:process'
 import { api, AppError } from './lib/api.ts'
-import { manualThreadOwner, pollLogin, startLogin } from './lib/auth.ts'
+import { authenticated, invalidateSessionAuth, manualThreadOwner, pollLogin, startLogin, syncSessionAuth } from './lib/auth.ts'
 import { getPlan, recoverInterruptedCheckins } from './lib/automation-store.ts'
 import { automationMediaOwner, automations } from './lib/automations.ts'
 import { demoSchema, demoThreads } from './lib/demo.ts'
 import { createPayload, listThreads, loadSchema, records, validateDraft } from './lib/forms.ts'
 import { flushNotices, mailHistory, mailSettings, recoverInterruptedMail } from './lib/mail.ts'
 import { resolveFiles, stageMedia } from './lib/media.ts'
-import { addHistory, deleteSession, getMedia, getSession, history, manualThreads, saveManualThread, saveSession } from './lib/store.ts'
+import { addHistory, deleteSession, getMedia, getSession, history, manualThreads, saveManualThread, saveSession, sessionMaxAge } from './lib/store.ts'
 import { parseThreadReference, resolveThreadId } from './lib/thread-reference.ts'
 
 const root = join(import.meta.dir, '..')
@@ -47,7 +47,7 @@ function json(data: unknown, status = 200) {
 }
 const hash = (v: unknown) => createHash('sha256').update(JSON.stringify(v)).digest('hex')
 function requireAuth(s: Session) {
-  if (!s.token && !s.demo)
+  if (!authenticated(s))
     throw new AppError('请先使用微信扫码登录。', 401, 'AUTH_REQUIRED')
 }
 function schema(s: Session, id: string, recordId: string | number) {
@@ -74,7 +74,8 @@ async function routes(req: Request, url: URL, s: Session): Promise<Response> {
   const path = url.pathname
   if (path === '/api/auth/me' && req.method === 'GET') {
     return json({
-      authenticated: !!(s.token || s.demo),
+      authenticated: authenticated(s),
+      expired: !authenticated(s) && !!s.accountKey,
       demo: !!s.demo,
       user: s.user || null,
       expiresAt: s.token ? s.expire : null,
@@ -82,7 +83,7 @@ async function routes(req: Request, url: URL, s: Session): Promise<Response> {
     })
   }
   if (path === '/api/auth/demo' && req.method === 'POST') {
-    if (s.token)
+    if (s.token || s.accountKey)
       throw new AppError('请先退出当前微信账号，再进入演示。')
     s.demo = true
     s.user = { name: '体验用户', nickname: '本地演示' }
@@ -92,8 +93,9 @@ async function routes(req: Request, url: URL, s: Session): Promise<Response> {
   if (path === '/api/auth/login' && req.method === 'POST')
     return json(await startLogin(s))
   if (path === '/api/auth/poll' && req.method === 'POST') {
+    const wasSuccessful = s.login?.status === 'success'
     const result = await pollLogin(s)
-    if (result.status === 'success' && s.accountKey) {
+    if (!wasSuccessful && result.status === 'success' && s.accountKey) {
       await automations.registerLogin(s.accountKey, s)
       void automations.tick().catch(() => console.warn('自动签到检查未完成，下次检查将继续。'))
     }
@@ -387,11 +389,21 @@ async function start() {
               expire: Date.now() + 7 * 86400000,
             }
             saveSession(s)
-            cookie = `jielong_session=${s.id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800${process.env.PUBLIC_ORIGIN?.startsWith('https:')
-              ? '; Secure'
-              : ''}`
           }
-          response = await routes(req, url, s)
+          syncSessionAuth(s)
+          cookie = `jielong_session=${s.id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${sessionMaxAge}${process.env.PUBLIC_ORIGIN?.startsWith('https:')
+            ? '; Secure'
+            : ''}`
+          try {
+            response = await routes(req, url, s)
+          }
+          catch (error) {
+            if (!url.pathname.startsWith('/api/auth/') && error instanceof AppError && error.code === 'AUTH_REQUIRED')
+              invalidateSessionAuth(s)
+            throw error
+          }
+          if (url.pathname === '/api/auth/logout' && req.method === 'POST')
+            cookie = cookie.replace(`Max-Age=${sessionMaxAge}`, 'Max-Age=0')
         }
         else if (req.method === 'GET' || req.method === 'HEAD') {
           const files: Record<string, string> = {
