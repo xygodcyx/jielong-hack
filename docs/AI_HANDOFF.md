@@ -1,6 +1,6 @@
 # 接龙工作台：项目说明与 AI 交接文档
 
-交接日期：2026-11-24，业务时区：`Asia/Shanghai`。本文件对应行为版本 `fe29008`，描述已实现行为；后续修改以源码、测试和用户最新要求为准。
+交接日期：2026-11-24，业务时区：`Asia/Shanghai`。原始行为版本为 `fe29008`；2026-11-27 补充跨设备登录续期行为。后续修改以源码、测试和用户最新要求为准。
 
 这是一个可独立运行的本地 Web 项目。阅读本文件不需要原聊天记录，也不需要取得真实账号凭证。用户使用 `jielong-hack` 作为目录名，应用名称与包名分别为“接龙工作台”和 `jielong-studio`。
 
@@ -176,15 +176,15 @@ flowchart LR
 
 ### 4.2 会话、账号与 owner
 
-| 范围                   | owner / key                                               | 生命周期                   |
-| ---------------------- | --------------------------------------------------------- | -------------------------- |
-| 网页会话               | 随机 `session.id`                                         | Cookie 对应的有效会话      |
-| 真实账号               | `wechat:` 加上 CurrentUser 的 `Id` 或 `OpenId` 的 SHA-256 | 同一微信账号跨会话稳定     |
-| 演示账号               | `demo:<session.id>`                                       | 仅该演示会话稳定           |
-| 手动提交历史与暂存附件 | `session.id`                                              | 不自动迁移到新的网页会话   |
-| 手动添加任务           | 稳定账号 key                                              | 同一真实账号重新登录后保留 |
-| 自动签到计划与凭证     | 稳定账号 key                                              | 独立于网页会话持久保存     |
-| 自动签到历史与附件     | `automation:<稳定账号 key>`                               | 同一真实账号跨会话可用     |
+| 范围                   | owner / key                                               | 生命周期                       |
+| ---------------------- | --------------------------------------------------------- | ------------------------------ |
+| 网页会话               | 随机 `session.id`                                         | 独立于 Token，按访问续期一年   |
+| 真实账号               | `wechat:` 加上 CurrentUser 的 `Id` 或 `OpenId` 的 SHA-256 | 同一微信账号跨会话稳定         |
+| 演示账号               | `demo:<session.id>`                                       | 仅该演示会话稳定               |
+| 手动提交历史与暂存附件 | `session.id`                                              | 不自动迁移到新的网页会话       |
+| 手动添加任务           | 稳定账号 key                                              | 同一真实账号重新登录后保留     |
+| 自动签到计划与账号凭证 | 稳定账号 key                                              | 凭证供已绑定网页会话与后台共享 |
+| 自动签到历史与附件     | `automation:<稳定账号 key>`                               | 同一真实账号跨会话可用         |
 
 `GET /api/auth/me` 的 `scope` 是 session ID 的摘要，用于浏览器草稿隔离，不是稳定账号 key，也不是登录凭证。不能用客户端传来的账号标识决定数据归属。
 
@@ -192,17 +192,17 @@ flowchart LR
 
 数据目录在 `store.ts` 导入时创建，目录权限 0700，`state.sqlite` 权限 0600，启用 WAL。业务 JSON 通常保存在表的 `data TEXT` 列。
 
-| 表                    | 主键 / 唯一约束                       | 用途                                                                  |
-| --------------------- | ------------------------------------- | --------------------------------------------------------------------- |
-| `sessions`            | `id`                                  | 会话 JSON 与过期时间                                                  |
-| `history`             | `id`                                  | 提交结果，按 owner 查最近 100 条                                      |
-| `media`               | `id`                                  | 附件 owner、元数据、磁盘路径                                          |
-| `drafts`              | `(owner, thread)`                     | 预留的服务端普通草稿辅助函数；当前普通编辑器实际使用 IndexedDB        |
-| `saved_threads`       | `(owner, thread_id)`                  | 手动添加任务，重复添加更新摘要但保留创建顺序                          |
-| `automation_accounts` | `owner`                               | 后台使用的会话凭证快照，不包含二维码轮询 login 对象                   |
-| `checkin_plans`       | `id`，另有 `UNIQUE(owner, thread_id)` | 自动签到计划，每账号最多保存 50 个                                    |
-| `daily_checkins`      | `(plan_id, date)`                     | 每日 schema/draft/结果；另有 `status / revision` 列用于状态与版本检查 |
-| `mail_outbox`         | `id`                                  | 通知内容、收件人、状态、尝试次数、下次发送时间与脱敏错误              |
+| 表                    | 主键 / 唯一约束                       | 用途                                                                                |
+| --------------------- | ------------------------------------- | ----------------------------------------------------------------------------------- |
+| `sessions`            | `id`                                  | 会话 JSON 与设备记忆期限；`expire` 是 Token 期限，`sessionExpiresAt` 是独立会话期限 |
+| `history`             | `id`                                  | 提交结果，按 owner 查最近 100 条                                                    |
+| `media`               | `id`                                  | 附件 owner、元数据、磁盘路径                                                        |
+| `drafts`              | `(owner, thread)`                     | 预留的服务端普通草稿辅助函数；当前普通编辑器实际使用 IndexedDB                      |
+| `saved_threads`       | `(owner, thread_id)`                  | 手动添加任务，重复添加更新摘要但保留创建顺序                                        |
+| `automation_accounts` | `owner`                               | 同账号网页与后台共享的最新凭证快照，不包含二维码轮询 login 对象                     |
+| `checkin_plans`       | `id`，另有 `UNIQUE(owner, thread_id)` | 自动签到计划，每账号最多保存 50 个                                                  |
+| `daily_checkins`      | `(plan_id, date)`                     | 每日 schema/draft/结果；另有 `status / revision` 列用于状态与版本检查               |
+| `mail_outbox`         | `id`                                  | 通知内容、收件人、状态、尝试次数、下次发送时间与脱敏错误                            |
 
 附件字节位于 `<数据目录>/media/<UUID>`，真实路径只保存在服务端元数据。SQLite 初始化分散在 `store.ts / automation-store.ts / mail.ts` 的 `CREATE TABLE IF NOT EXISTS` 中，当前没有独立迁移框架。新增字段或约束需兼容已有数据，不能用删库代替迁移。
 
@@ -222,13 +222,19 @@ IndexedDB 数据库 `jielong-studio`，版本 1，对象仓库 `drafts`。普通
 2. 从响应页面解析 UUID，二维码有效期按本机约 5 分钟记录。本站 `/api/auth/qr` 代理二维码图片。
 3. `pollLogin()` 调用微信长轮询接口：404 表示已扫码、405 携带授权 code，402/403/666 视为过期。
 4. 使用 code 请求上游 `/api/User/OpenAuth`，再请求 `/api/User/CurrentUser`，保存 Bearer、有效期、公开用户摘要与稳定账号 key。
-5. 登录成功路由调用 `automations.registerLogin()` 更新后台凭证，并触发一次调度检查，是否补交仍受当天时段与去重约束。
+5. 仅在二维码首次完成登录时调用 `automations.registerLogin()` 更新账号共享凭证，并触发一次调度检查，是否补交仍受当天时段与去重约束。重复轮询已成功的二维码不重新登记旧凭证；普通待办保存也不能覆盖已登记的账号凭证。
 
 Token 有效期优先使用上游响应，可解析秒、毫秒或日期字符串；无法识别时当前实现回退约 72 小时。不能把 72 小时写成平台保证，远端拒绝登录时仍需重新扫码。
 
-Cookie 为 `jielong_session`，HttpOnly、SameSite=Strict，创建时 Max-Age 7 天；真实会话是否有效还取决于服务端的凭证过期时间。设置 HTTPS `PUBLIC_ORIGIN` 时增加 Secure。
+Cookie 为 `jielong_session`，HttpOnly、SameSite=Strict，每次 API 访问将 Cookie 与服务端 `sessionExpiresAt` 续期一年。设置 HTTPS `PUBLIC_ORIGIN` 时增加 Secure。Token 的 `expire` 只决定是否能访问上游，不再让设备忘记已验证账号。
 
-退出会删除网页会话、对应普通服务端草稿和内存预览。它**不删除手动添加任务，也不停止自动签到计划**，后者有独立凭证；用户应通过暂停开关停止后续执行。
+每次 API 请求先用服务端会话内已验证的 `accountKey` 读取 `automation_accounts`，只同步 Token、有效期与公开用户摘要，保留当前设备的 session ID、普通草稿/附件归属与二维码状态。同一服务上任意设备重新扫码后，其他已绑定该微信的设备下一次请求即使用最新凭证；即使旧 Token 尚未到期，也会切换。账号最新凭证过期或被上游拒绝时，保留会话与账号信息并返回未认证状态；失效页面在返回前台或约 30 秒轮询时检查恢复，编辑器内容不被重建。
+
+兼容旧数据：旧会话没有 `sessionExpiresAt`、但具有真实账号 `accountKey` 时，首次读取保留账号绑定并补上独立期限，包括旧 Token 已过期的记录。不需要清库或迁移真实数据目录。此兼容依赖浏览器仍持有原会话 Cookie；旧版已把 Cookie 替换成匿名会话、用户主动退出/清理 Cookie，或访问另一套独立数据目录的服务时，仍须重新扫码。客户端传入的昵称、账号 ID 或其他本地展示信息不能用于认领账号。
+
+上游明确拒绝登录时，仅失效与失败请求 Token 匹配的凭证，防止旧请求迟到的失败响应使其他设备的新登录失效。提交请求不因此自动重放，继续保留既有 `unknown` 与去重规则。
+
+退出会删除当前网页会话、对应普通服务端草稿和内存预览，并清除当前 Cookie；已退出设备不能自动恢复。它**不影响其他设备的登录、不删除手动添加任务，也不停止自动签到计划**；用户应通过暂停开关停止后续执行。
 
 ### 5.2 输入解析
 
@@ -454,32 +460,32 @@ HTTP 401/403 或业务 `Type=100000/100001` 归为 `AUTH_REQUIRED`；网络异�
 
 ### 10.2 路由表
 
-| 方法与路径                              | 请求                                                           | 主要返回 / 行为                                            |
-| --------------------------------------- | -------------------------------------------------------------- | ---------------------------------------------------------- |
-| `GET /api/auth/me`                      | 无                                                             | authenticated、demo、user、expiresAt、scope；不返回 Token  |
-| `POST /api/auth/demo`                   | `{}`                                                           | 进入演示；已真实登录时需要先退出                           |
-| `POST /api/auth/login`                  | `{}`                                                           | status、expiresAt、qrUrl                                   |
-| `POST /api/auth/poll`                   | `{}`                                                           | pending/scanned/success/expired 等状态；成功时更新后台凭证 |
-| `GET /api/auth/qr`                      | 有效扫码会话                                                   | 二维码 PNG                                                 |
-| `POST /api/auth/logout`                 | `{}`                                                           | 删除网页会话与其内存预览                                   |
-| `GET /api/threads`                      | `page=1&listType=1`                                            | threads、原始 page；页面最大 1000                          |
-| `POST /api/resolve`                     | `{ "value": "链接或 ID" }`                                     | `{ id }`，只解析，不加入手动分类                           |
-| `GET /api/manual-threads`               | `page=1`                                                       | 已保存 threads 与 page，每页 50                            |
-| `POST /api/manual-threads`              | `{ "value": "链接或 ID" }`                                     | 解析、读取、保存，返回 `{ id, form }`                      |
-| `GET /api/threads/:id/form`             | 可选 `recordId`，默认 `0`                                      | 去掉内部 base 的 FormSchema                                |
-| `GET /api/threads/:id/records`          | 无                                                             | `{ records }`，本人记录摘要                                |
-| `POST /api/media`                       | multipart `file`                                               | 暂存附件元数据和 UUID，不含磁盘 path                       |
-| `GET /api/media/:uuid`                  | 当前会话 owner                                                 | 普通本机附件字节                                           |
-| `GET /api/automation-media/:uuid`       | 稳定账号 owner                                                 | 自动待办本机附件字节                                       |
-| `POST /api/threads/:id/prepare`         | Draft + privacyAgreed，可选 recordId 查询参数                  | key、expiresAt、payload、summary、demo；可能已外传上传附件 |
-| `POST /api/threads/:id/submit`          | `{ "key": "预览 key" }`                                        | ok、demo、message                                          |
-| `GET /api/history`                      | 无                                                             | 当前会话手动历史 + 当前账号自动历史，合并取最近 100 条     |
-| `GET /api/automations`                  | 无                                                             | plans、mail 配置摘要、notices；不返回 Token/SMTP 密钥      |
-| `POST /api/automations`                 | `{ "threadId": "任务引用" }`                                   | plan、mail、run、editable；创建或取得周期计划，不自动启用  |
-| `GET /api/automations/:planId/draft`    | 可选 `date=YYYY-MM-DD`                                         | plan、mail、run、editable；可能初始化每日待办              |
-| `POST /api/automations/:planId/save`    | date、revision、draft、time、recipient、enabled、privacyAgreed | `{ run }`，验证并保存待办与计划设置                        |
-| `POST /api/automations/:planId/toggle`  | `{ "enabled": true或false }`                                   | `{ ok: true }`；启用时验证待办                             |
-| `POST /api/automations/:planId/refresh` | date、revision                                                 | `{ run }`，从当前原任务更新表单结构                        |
+| 方法与路径                              | 请求                                                           | 主要返回 / 行为                                                    |
+| --------------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------------------ |
+| `GET /api/auth/me`                      | 无                                                             | authenticated、expired、demo、user、expiresAt、scope；不返回 Token |
+| `POST /api/auth/demo`                   | `{}`                                                           | 进入演示；已真实登录时需要先退出                                   |
+| `POST /api/auth/login`                  | `{}`                                                           | status、expiresAt、qrUrl                                           |
+| `POST /api/auth/poll`                   | `{}`                                                           | pending/scanned/success/expired 等状态；成功时更新后台凭证         |
+| `GET /api/auth/qr`                      | 有效扫码会话                                                   | 二维码 PNG                                                         |
+| `POST /api/auth/logout`                 | `{}`                                                           | 删除网页会话与其内存预览                                           |
+| `GET /api/threads`                      | `page=1&listType=1`                                            | threads、原始 page；页面最大 1000                                  |
+| `POST /api/resolve`                     | `{ "value": "链接或 ID" }`                                     | `{ id }`，只解析，不加入手动分类                                   |
+| `GET /api/manual-threads`               | `page=1`                                                       | 已保存 threads 与 page，每页 50                                    |
+| `POST /api/manual-threads`              | `{ "value": "链接或 ID" }`                                     | 解析、读取、保存，返回 `{ id, form }`                              |
+| `GET /api/threads/:id/form`             | 可选 `recordId`，默认 `0`                                      | 去掉内部 base 的 FormSchema                                        |
+| `GET /api/threads/:id/records`          | 无                                                             | `{ records }`，本人记录摘要                                        |
+| `POST /api/media`                       | multipart `file`                                               | 暂存附件元数据和 UUID，不含磁盘 path                               |
+| `GET /api/media/:uuid`                  | 当前会话 owner                                                 | 普通本机附件字节                                                   |
+| `GET /api/automation-media/:uuid`       | 稳定账号 owner                                                 | 自动待办本机附件字节                                               |
+| `POST /api/threads/:id/prepare`         | Draft + privacyAgreed，可选 recordId 查询参数                  | key、expiresAt、payload、summary、demo；可能已外传上传附件         |
+| `POST /api/threads/:id/submit`          | `{ "key": "预览 key" }`                                        | ok、demo、message                                                  |
+| `GET /api/history`                      | 无                                                             | 当前会话手动历史 + 当前账号自动历史，合并取最近 100 条             |
+| `GET /api/automations`                  | 无                                                             | plans、mail 配置摘要、notices；不返回 Token/SMTP 密钥              |
+| `POST /api/automations`                 | `{ "threadId": "任务引用" }`                                   | plan、mail、run、editable；创建或取得周期计划，不自动启用          |
+| `GET /api/automations/:planId/draft`    | 可选 `date=YYYY-MM-DD`                                         | plan、mail、run、editable；可能初始化每日待办                      |
+| `POST /api/automations/:planId/save`    | date、revision、draft、time、recipient、enabled、privacyAgreed | `{ run }`，验证并保存待办与计划设置                                |
+| `POST /api/automations/:planId/toggle`  | `{ "enabled": true或false }`                                   | `{ ok: true }`；启用时验证待办                                     |
+| `POST /api/automations/:planId/refresh` | date、revision                                                 | `{ run }`，从当前原任务更新表单结构                                |
 
 静态资源只暴露 `/、/styles.css、/assets/app.js、/favicon.svg、/watermark-logo.webp`。其他前端路径不会自动回退 index.html；`/?automation=1` 是查询参数，不是新增页面路由。
 
@@ -517,16 +523,17 @@ pnpm run build
 
 ### 11.2 现有测试
 
-行为版本 `fe29008` 上一次验证为 **38 项通过、0 失败、205 次断言**，lint、typecheck、build 均通过；这不是对未来提交自动成立的承诺。
+行为版本 `fe29008` 上一次验证为 **38 项通过、0 失败、205 次断言**。2026-11-27 跨设备登录续期更新后为 **45 项通过、0 失败、268 次断言**，lint、typecheck、build 均通过；这不是对未来提交自动成立的承诺。
 
 | 测试文件                                                        | 覆盖范围                                                                                                |
 | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
 | [`protocol.test.ts`](../tests/protocol.test.ts)                 | listType、FeedBack/CheckIn 协议、字符串记录 ID、业务失败、字段验证、媒体限制、COS 上传凭证隔离          |
 | [`thread-reference.test.ts`](../tests/thread-reference.test.ts) | 短 ID、直接链接、类型识别、公开多级跳转、异常目标、循环与跳转上限                                       |
 | [`saved-threads.test.ts`](../tests/saved-threads.test.ts)       | 手动分类规范化去重、账号跨会话与隔离                                                                    |
+| [`auth.test.ts`](../tests/auth.test.ts)                         | 设备记忆与 Token 分离、跨设备凭证同步、旧数据兼容、账号/演示隔离、扫码身份验证与迟到失效响应保护        |
 | [`automations.test.ts`](../tests/automations.test.ts)           | 北京时间、昨日内容、每日去重、版本冲突、账号/附件隔离、续期补交、截止、暂停、中断恢复、无邮箱与邮件去重 |
 | [`mail.test.ts`](../tests/mail.test.ts)                         | 模拟发送、失败退避、去重、中断 unknown、模板转义、邮箱注入拒绝                                          |
-| [`integration.test.ts`](../tests/integration.test.ts)           | 独立 Bun 服务中的演示表单、上传、确认、重复提交、CSRF、跨会话隔离、重启持久化                           |
+| [`integration.test.ts`](../tests/integration.test.ts)           | 独立 Bun 服务中的演示表单、上传、确认、重复提交、CSRF、跨会话隔离、重启持久化、跨设备续期与主动退出     |
 
 `tests/setup.ts` 在任何存储导入前设置临时 `JIELONG_DATA_DIR`。集成测试使用端口 **43210**；端口被占用时先查清占用来源，不要误杀用户进程。模拟邮件使用注入发送函数，自动签到使用可注入业务依赖，不调用真实 SMTP 或提交接口。
 
@@ -576,7 +583,7 @@ Git 忽略 `.local/、.env、*.har、node_modules/、public/assets/`。不要为
 | 不支持 listType      | 是否把 ThreadType 误用作列表来源                      | 使用 1/2/5，参照 protocol 测试                       |
 | 短 ID 或链接打不开   | 输入路径、分享 Location、登录是否过期                 | 检查 thread-reference，先分清登录/网络/业务错误      |
 | 页面 403“来源不匹配” | 请求 Origin 与 PUBLIC_ORIGIN 是否一致                 | 修正访问地址或配置；不要删除同源检查                 |
-| 页面 401             | Cookie 对应会话或上游凭证是否有效                     | 在网站重新微信扫码                                   |
+| 页面 401             | Cookie 是否仍绑定账号、共享凭证是否有效               | 同一服务任一设备重新扫码；仍记住该账号的设备自动恢复 |
 | 计划没执行           | enabled、北京时间、23:00 截止、进程/网络、run 状态    | 在自动签到页查看 message；不是所有状态都允许自动重试 |
 | 等待开放             | 上游 canSubmit、任务是否结束、nextCheckAt             | 等待下一次检查或核对官方开放规则                     |
 | 409                  | revision 变化、已领取/已提交、原表单结构变化          | 刷新并核对；不要去掉版本条件                         |
