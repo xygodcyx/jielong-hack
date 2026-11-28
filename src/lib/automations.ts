@@ -377,27 +377,46 @@ export class AutomationService {
     return done
   }
 
-  private needsLogin(plan: CheckinPlan, run?: DailyCheckin) {
+  private expiredNotice(plan: CheckinPlan) {
     const account = automationAccount(plan.owner)
-    if (run && run.status !== 'needs_login')
-      updateDailyCheckin({ ...run, status: 'needs_login', message: '登录已失效，请在工作台重新微信扫码；23:00 前恢复可补交当天。' })
+    const now = this.dependencies.now()
+    const canSubmitToday = now < closingAt(beijingDate(now))
     this.notice(plan, `expired:${plan.owner}:${account?.token
       ? createHash('sha256').update(account.token).digest('hex').slice(0, 20)
-      : 'missing'}:${plan.recipient}`, '微信登录已过期', [plan.thread.title, '循环签到正在等待重新登录。请打开工作台，使用原微信账号扫码。', '恢复登录后，仅在签到时间至当天 23:00 之间核对并补交今日记录；不会补交往日记录。'])
+      : 'missing'}:${plan.recipient}`, '微信登录已过期', [
+      plan.thread.title,
+      '微信登录已过期，已启用的循环签到需要重新扫码后才能继续。请打开工作台，使用原微信账号扫码。',
+      canSubmitToday
+        ? '恢复登录后，仅在签到时间至当天 23:00 之间核对并补交今日记录；不会补交往日记录。'
+        : '今天已超过 23:00，不会补交今日签到；请在下次签到前重新扫码，不补交往日记录。',
+    ])
+  }
+
+  private needsLogin(plan: CheckinPlan, run?: DailyCheckin) {
+    if (run && run.status !== 'needs_login')
+      updateDailyCheckin({ ...run, status: 'needs_login', message: '登录已失效，请在工作台重新微信扫码；23:00 前恢复可补交当天。' })
+    this.expiredNotice(plan)
   }
 
   private async execute(plan: CheckinPlan, now: number) {
     const date = beijingDate(now)
     let run = dailyCheckin(plan.id, date)
-    if (run && terminal.has(run.status))
+    const account = automationAccount(plan.owner)
+    const expired = !account || (!plan.demo && (!account.token || account.expire <= now))
+    if (run && terminal.has(run.status)) {
+      // 今天的签到已经结束，但 Token 过期仍需提醒，否则要到第二天才会发现。
+      if (expired)
+        this.expiredNotice(plan)
       return
+    }
     if (now >= closingAt(date)) {
+      if (expired)
+        this.expiredNotice(plan)
       if (run && !run.submittedAt)
         this.finish(plan, run, 'missed', '已超过当天 23:00，保留记录，不自动补交往日签到。')
       return
     }
-    const account = automationAccount(plan.owner)
-    if (!account || (!plan.demo && (!account.token || account.expire <= now))) {
+    if (expired) {
       this.needsLogin(plan, run || undefined)
       return
     }

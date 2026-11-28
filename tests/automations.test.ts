@@ -334,3 +334,44 @@ it('登录失效邮件按凭证去重，重新登录通知与结果通知各一�
     }
   }
 })
+
+it('token 过期后即使今日已完成或已过 23:00，也会立即提醒且不改写终态', async () => {
+  vi.stubEnv('SMTP_HOST', 'fixture.invalid')
+  vi.stubEnv('SMTP_USER', 'fixture@example.com')
+  vi.stubEnv('SMTP_PASS', 'fixture-not-a-secret')
+
+  const completed = await fixture()
+  await completed.enable()
+  completed.clock(stamp('18:00'))
+  await completed.service.tick()
+  expect(dailyCheckin(completed.plan.id, completed.run.date)?.status).toBe('success')
+  savePlan({
+    ...getPlan(completed.plan.id),
+    recipient: 'completed@example.com',
+  })
+  saveAutomationAccount(completed.owner, {
+    ...completed.session,
+    expire: stamp('19:00'),
+  }, true)
+  completed.clock(stamp('19:30'))
+  await completed.service.tick()
+  await completed.service.tick()
+  expect(dailyCheckin(completed.plan.id, completed.run.date)?.status).toBe('success')
+  const completedMail = mailHistory(completed.owner)
+  expect(completedMail.filter(mail => mail.subject === '【接龙工作台】微信登录已过期')).toHaveLength(1)
+
+  const late = await fixture()
+  await late.enable()
+  savePlan({
+    ...getPlan(late.plan.id),
+    recipient: 'late@example.com',
+  })
+  saveAutomationAccount(late.owner, {
+    ...late.session,
+    expire: stamp('22:59'),
+  }, true)
+  late.clock(stamp('23:30'))
+  await late.service.tick()
+  expect(dailyCheckin(late.plan.id, late.run.date)?.status).toBe('missed')
+  expect(mailHistory(late.owner).map(mail => mail.subject)).toContain('【接龙工作台】微信登录已过期')
+})
